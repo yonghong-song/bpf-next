@@ -225,6 +225,16 @@ static void free_htab_elem(struct bpf_htab *htab, struct htab_elem *l)
 	kfree_rcu(l, rcu);
 }
 
+static inline struct bucket *__select_bucket(struct bpf_htab *htab, u32 hash)
+{
+	return &htab->buckets[hash & (htab->n_buckets - 1)];
+}
+
+static inline struct hlist_head *select_bucket(struct bpf_htab *htab, u32 hash)
+{
+	return &__select_bucket(htab, hash)->head;
+}
+
 static void bpf_tcp_close(struct sock *sk, long timeout)
 {
 	void (*close_fun)(struct sock *sk, long timeout);
@@ -268,9 +278,15 @@ static void bpf_tcp_close(struct sock *sk, long timeout)
 				smap_release_sock(psock, sk);
 			}
 		} else {
+			u32 hash = e->hash_link->hash;
+			struct bucket *b;
+
+			b = __select_bucket(e->htab, hash);
+			raw_spin_lock_bh(&b->lock);
 			hlist_del_rcu(&e->hash_link->hash_node);
 			smap_release_sock(psock, e->hash_link->sk);
 			free_htab_elem(e->htab, e->hash_link);
+			raw_spin_unlock_bh(&b->lock);
 		}
 	}
 	write_unlock_bh(&sk->sk_callback_lock);
@@ -2043,16 +2059,6 @@ free_htab:
 	return ERR_PTR(err);
 }
 
-static inline struct bucket *__select_bucket(struct bpf_htab *htab, u32 hash)
-{
-	return &htab->buckets[hash & (htab->n_buckets - 1)];
-}
-
-static inline struct hlist_head *select_bucket(struct bpf_htab *htab, u32 hash)
-{
-	return &__select_bucket(htab, hash)->head;
-}
-
 static void sock_hash_free(struct bpf_map *map)
 {
 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
@@ -2069,10 +2075,12 @@ static void sock_hash_free(struct bpf_map *map)
 	 */
 	rcu_read_lock();
 	for (i = 0; i < htab->n_buckets; i++) {
-		struct hlist_head *head = select_bucket(htab, i);
+		struct bucket *b = __select_bucket(htab, i);
+		struct hlist_head *head = &b->head;
 		struct hlist_node *n;
 		struct htab_elem *l;
 
+		raw_spin_lock_bh(&b->lock);
 		hlist_for_each_entry_safe(l, n, head, hash_node) {
 			struct sock *sock = l->sk;
 			struct smap_psock *psock;
@@ -2090,8 +2098,9 @@ static void sock_hash_free(struct bpf_map *map)
 				smap_release_sock(psock, sock);
 			}
 			write_unlock_bh(&sock->sk_callback_lock);
-			kfree(l);
+			free_htab_elem(htab, l);
 		}
+		raw_spin_unlock_bh(&b->lock);
 	}
 	rcu_read_unlock();
 	bpf_map_area_free(htab->buckets);
