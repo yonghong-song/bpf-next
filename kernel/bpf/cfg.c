@@ -407,10 +407,11 @@ static void calc_idoms(struct bpf_subprog_info *subprog, struct dom_info *di,
 			di->idom[idx] = di->idom[di->idom[idx]];
 }
 
-static int calc_dfs_tree(struct bpf_subprog_info *subprog, struct dom_info *di,
-			 bool reverse)
+static int
+calc_dfs_tree(struct bpf_verifier_env *env, struct bpf_subprog_info *subprog,
+	      struct dom_info *di, bool reverse)
 {
-	u16 bb_num = subprog->bb_num, sp = 0, idx, parent_idx;
+	u16 bb_num = subprog->bb_num, sp = 0, idx, parent_idx, i;
 	struct list_head *bb_list = &subprog->bbs;
 	u16 entry_bb_fake_idx = bb_num - 2;
 	struct bb_node *entry_bb, *exit_bb;
@@ -490,6 +491,13 @@ static int calc_dfs_tree(struct bpf_subprog_info *subprog, struct dom_info *di,
 
 	kfree(stack);
 
+	for (i = 0; i < bb_num - 2; i++) {
+		if (!di->dfs_order[i]) {
+			bpf_verifier_log_write(env, "cfg - unreachable insn\n");
+			return -EINVAL;
+		}
+	}
+
 	return 0;
 }
 
@@ -541,7 +549,8 @@ static int idoms_to_doms(struct bpf_subprog_info *subprog, struct dom_info *di)
  * The implementation also referenced GNU GCC 3.0.
  */
 
-int subprog_build_dom_info(struct bpf_subprog_info *subprog)
+int subprog_build_dom_info(struct bpf_verifier_env *env,
+			   struct bpf_subprog_info *subprog)
 {
 	struct dom_info di;
 	int ret;
@@ -550,7 +559,7 @@ int subprog_build_dom_info(struct bpf_subprog_info *subprog)
 	if (ret < 0)
 		goto free_dominfo;
 
-	ret = calc_dfs_tree(subprog, &di, false);
+	ret = calc_dfs_tree(env, subprog, &di, false);
 	if (ret < 0)
 		goto free_dominfo;
 

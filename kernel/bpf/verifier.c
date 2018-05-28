@@ -904,7 +904,8 @@ next:
 			if (ret < 0)
 				goto free_nodes;
 			subprog[cur_subprog].bb_num = ret;
-			ret = subprog_build_dom_info(&subprog[cur_subprog]);
+			ret = subprog_build_dom_info(env,
+						     &subprog[cur_subprog]);
 			if (ret < 0)
 				goto free_nodes;
 			if (subprog_has_loop(&subprog[cur_subprog])) {
