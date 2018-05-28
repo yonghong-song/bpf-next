@@ -24,6 +24,7 @@
 #include <linux/sort.h>
 #include <linux/perf_event.h>
 
+#include "cfg.h"
 #include "disasm.h"
 
 static const struct bpf_verifier_ops * const bpf_verifier_ops[] = {
@@ -807,6 +808,7 @@ static int check_subprogs(struct bpf_verifier_env *env)
 	struct bpf_subprog_info *subprog = env->subprog_info;
 	struct bpf_insn *insn = env->prog->insnsi;
 	int insn_cnt = env->prog->len;
+	struct list_head *cur_bb_list;
 
 	/* Add entry function. */
 	ret = add_subprog(env, 0);
@@ -841,20 +843,46 @@ static int check_subprogs(struct bpf_verifier_env *env)
 		for (i = 0; i < env->subprog_cnt; i++)
 			verbose(env, "func#%d @%d\n", i, subprog[i].start);
 
-	/* now check that all jumps are within the same subprog */
 	subprog_start = subprog[cur_subprog].start;
 	subprog_end = subprog[cur_subprog + 1].start;
+	cur_bb_list = &subprog[cur_subprog].bbs;
+	ret = subprog_init_bb(cur_bb_list, subprog_start);
+	if (ret < 0)
+		goto free_nodes;
+	/* now check that all jumps are within the same subprog */
 	for (i = 0; i < insn_cnt; i++) {
 		u8 code = insn[i].code;
 
 		if (BPF_CLASS(code) != BPF_JMP)
 			goto next;
-		if (BPF_OP(code) == BPF_EXIT || BPF_OP(code) == BPF_CALL)
+
+		if (BPF_OP(code) == BPF_EXIT) {
+			if (i + 1 < subprog_end) {
+				ret = subprog_append_bb(cur_bb_list, i + 1);
+				if (ret < 0)
+					goto free_nodes;
+			}
 			goto next;
+		}
+
+		if (BPF_OP(code) == BPF_CALL)
+			goto next;
+
 		off = i + insn[i].off + 1;
 		if (off < subprog_start || off >= subprog_end) {
 			verbose(env, "jump out of range from insn %d to %d\n", i, off);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto free_nodes;
+		}
+
+		ret = subprog_append_bb(cur_bb_list, off);
+		if (ret < 0)
+			goto free_nodes;
+
+		if (i + 1 < subprog_end) {
+			ret = subprog_append_bb(cur_bb_list, i + 1);
+			if (ret < 0)
+				goto free_nodes;
 		}
 next:
 		if (i == subprog_end - 1) {
@@ -865,15 +893,32 @@ next:
 			if (code != (BPF_JMP | BPF_EXIT) &&
 			    code != (BPF_JMP | BPF_JA)) {
 				verbose(env, "last insn is not an exit or jmp\n");
-				return -EINVAL;
+				ret = -EINVAL;
+				goto free_nodes;
 			}
+
+			ret = subprog_fini_bb(cur_bb_list, subprog_end);
+			if (ret < 0)
+				goto free_nodes;
 			subprog_start = subprog_end;
 			cur_subprog++;
-			if (cur_subprog < env->subprog_cnt)
+			if (cur_subprog < env->subprog_cnt) {
 				subprog_end = subprog[cur_subprog + 1].start;
+				cur_bb_list = &subprog[cur_subprog].bbs;
+				ret = subprog_init_bb(cur_bb_list,
+						      subprog_start);
+				if (ret < 0)
+					goto free_nodes;
+			}
 		}
 	}
-	return 0;
+
+	ret = 0;
+
+free_nodes:
+	subprog_free_bb(subprog, cur_subprog == env->subprog_cnt ?
+					cur_subprog - 1 : cur_subprog);
+	return ret;
 }
 
 static
