@@ -766,6 +766,109 @@ bool subprog_has_loop(struct cfg_node_allocator *allocator,
 	return false;
 }
 
+/* We don't want to do any further loop bounds analysis for irreducible loop,
+ * so just reject programs containing it.
+ *
+ * The current DOM based loop detection can't detect irreducible loop. We'd
+ * use the algorithm given by Eric Stoltz to detect it. The algorithm requires
+ * DOM info.
+ *
+ * Algorithm pseudo code:
+ *
+ *   test_dom(a,b) returns TRUE if a dominates b
+ *   push( v ) pushes v onto a reverse topologically-sorted stack
+ *
+ *   top_sort( entry node )
+ *
+ *   top_sort( node v ) {
+ *	mark_visited( v );
+ *	Visit all successors s of v {
+ *		if (mark_visited(s) && !pushed(s) && !test_dom(s, v)) {
+ *			Irreducible_Graph = TRUE;
+ *			Exit -- no need to continue now!
+ *		}
+ *		if(!mark_visited(s))
+ *			top_sort( s );
+ *	}
+ *	push( v );
+ *   }
+ */
+int subprog_has_irreduciable_loop(struct cfg_node_allocator *allocator,
+				  struct bpf_subprog_info *subprog)
+{
+	u16 bb_num = subprog->bb_num - 2, sp = 0, *status;
+	void **bb_list = (void **)&subprog->bbs;
+	struct edge_node **stack, *e, *prev_e;
+	int lane_len = BITS_TO_LONGS(bb_num);
+	struct bb_node *entry_bb, *exit_bb;
+	int found = 0;
+
+	stack = kmalloc_array(bb_num, sizeof(struct edge_node *), GFP_KERNEL);
+	if (!stack)
+		return -ENOMEM;
+
+	status = kcalloc(bb_num, sizeof(u16), GFP_KERNEL);
+	if (!status)
+		return -ENOMEM;
+
+	entry_bb = entry_bb(bb_list);
+	exit_bb = exit_bb(bb_list);
+	e = cfg_node_delink(allocator, &entry_bb->e_succs);
+	prev_e = e;
+
+	while (1) {
+		struct bb_node *bb_dst;
+
+		while (e) {
+			bb_dst = e->dst;
+
+			if (bb_dst == exit_bb ||
+			    status[bb_dst->idx] == DFS_NODE_EXPLORED) {
+				prev_e = e;
+				e = cfg_node_delink(allocator, &e->link);
+				continue;
+			}
+
+			if (status[bb_dst->idx] == DFS_NODE_EXPLORING) {
+				u16 src_idx = e->src->idx;
+				unsigned long *bb_map;
+
+				bb_map = subprog->dtree + src_idx * lane_len;
+				if (!test_bit(bb_dst->idx, bb_map)) {
+					found = 1;
+					goto free_and_ret;
+				} else {
+					prev_e = e;
+					e = cfg_node_delink(allocator,
+							    &e->link);
+					continue;
+				}
+			}
+
+			status[bb_dst->idx] = DFS_NODE_EXPLORING;
+			stack[sp++] = e;
+			/* e should never be NULL as it couldn't be exit_bb. */
+			e = cfg_node_delink(allocator, &bb_dst->e_succs);
+		}
+
+		if (prev_e->src != entry_bb)
+			status[prev_e->src->idx] = DFS_NODE_EXPLORED;
+
+		if (!sp)
+			break;
+
+		e = stack[--sp];
+		prev_e = e;
+		e = cfg_node_delink(allocator, &e->link);
+	}
+
+free_and_ret:
+	kfree(stack);
+	kfree(status);
+
+	return found;
+}
+
 static int cmp_subprogs(const void *a, const void *b)
 {
 	return ((struct bpf_subprog_info *)a)->start -
@@ -823,8 +926,6 @@ static void ci_next(struct cfg_node_allocator *allocator,
 	ci->callee = cfg_node_delink(allocator, &c->link);
 }
 
-#define EXPLORING	1
-#define EXPLORED	2
 int cgraph_check_recursive_unreachable(struct bpf_verifier_env *env,
 				       struct cfg_node_allocator *allocator,
 				       struct bpf_subprog_info *subprog)
@@ -843,19 +944,19 @@ int cgraph_check_recursive_unreachable(struct bpf_verifier_env *env,
 	}
 	ci.head = subprog->callees;
 	ci.callee = subprog->callees;
-	status[0] = EXPLORING;
+	status[0] = DFS_NODE_EXPLORING;
 
 	while (1) {
 		while (!ci_end_p(&ci)) {
 			callee = ci.callee;
 			idx = callee->callee_idx;
-			if (status[idx] == EXPLORING) {
+			if (status[idx] == DFS_NODE_EXPLORING) {
 				bpf_verifier_log_write(env, "cgraph - recursive call\n");
 				ret = -EINVAL;
 				goto err_free;
 			}
 
-			status[idx] = EXPLORING;
+			status[idx] = DFS_NODE_EXPLORING;
 
 			if (sp == 64) {
 				bpf_verifier_log_write(env, "cgraph - call frame too deep\n");
@@ -869,10 +970,10 @@ int cgraph_check_recursive_unreachable(struct bpf_verifier_env *env,
 		}
 
 		if (ci.head)
-			status[ci.head->caller_idx] = EXPLORED;
+			status[ci.head->caller_idx] = DFS_NODE_EXPLORED;
 		else
 			/* leaf func. */
-			status[idx] = EXPLORED;
+			status[idx] = DFS_NODE_EXPLORED;
 
 		if (!sp)
 			break;
@@ -882,7 +983,7 @@ int cgraph_check_recursive_unreachable(struct bpf_verifier_env *env,
 	}
 
 	for (idx = 0; idx < env->subprog_cnt; idx++)
-		if (status[idx] != EXPLORED) {
+		if (status[idx] != DFS_NODE_EXPLORED) {
 			bpf_verifier_log_write(env, "cgraph - unreachable subprog\n");
 			ret = -EINVAL;
 			goto err_free;

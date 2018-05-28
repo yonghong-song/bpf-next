@@ -913,6 +913,15 @@ next:
 						     &subprog[cur_subprog]);
 			if (ret < 0)
 				goto free_nodes;
+			ret = subprog_has_irreduciable_loop(&allocator,
+							&subprog[cur_subprog]);
+			if (ret < 0)
+				goto free_nodes;
+			if (ret > 0) {
+				verbose(env, "cfg - irreduciable loop detected");
+				ret = -EINVAL;
+				goto free_nodes;
+			}
 			if (subprog_has_loop(&allocator,
 					     &subprog[cur_subprog])) {
 				verbose(env, "cfg - loop detected");
