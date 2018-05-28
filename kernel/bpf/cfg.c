@@ -82,7 +82,113 @@ struct dom_info {
 	u16 dfsnum;
 };
 
-int subprog_append_bb(struct list_head *bb_list, int head)
+struct node_pool {
+	struct list_head l;
+	void *data;
+	u32 size;
+	u32 used;
+};
+
+#define first_node_pool(pool_list)	\
+	list_first_entry(pool_list, struct node_pool, l)
+
+#define MEM_CHUNK_SIZE	(1024)
+
+static int cfg_node_allocator_grow(struct cfg_node_allocator *allocator,
+				   int min_grow_size)
+{
+	int s = min_grow_size;
+	struct node_pool *pool;
+	void *data;
+
+	s += sizeof(struct node_pool);
+	s = ALIGN(s, MEM_CHUNK_SIZE);
+	data = kzalloc(s, GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	pool = (struct node_pool *)data;
+	pool->data = pool + 1;
+	pool->size = s - sizeof(struct node_pool);
+	pool->used = 0;
+	allocator->cur_free_pool = pool;
+	list_add_tail(&pool->l, &allocator->pools);
+
+	return 0;
+}
+
+static void *cfg_node_alloc(struct cfg_node_allocator *allocator, int size)
+{
+	struct node_pool *pool = allocator->cur_free_pool;
+	void *p;
+
+	if (pool->used + size > pool->size) {
+		int ret = cfg_node_allocator_grow(allocator, size);
+
+		if (ret < 0)
+			return NULL;
+
+		pool = allocator->cur_free_pool;
+	}
+
+	p = pool->data + pool->used;
+	pool->used += size;
+
+	return p;
+}
+
+static struct bb_node *get_single_bb_nodes(struct cfg_node_allocator *allocator)
+{
+	int size = sizeof(struct bb_node);
+
+	return (struct bb_node *)cfg_node_alloc(allocator, size);
+}
+
+static struct edge_node *get_edge_nodes(struct cfg_node_allocator *allocator,
+					int num)
+{
+	int size = num * sizeof(struct edge_node);
+
+	return (struct edge_node *)cfg_node_alloc(allocator, size);
+}
+
+static struct cedge_node *
+get_single_cedge_node(struct cfg_node_allocator *allocator)
+{
+	int size = sizeof(struct cedge_node);
+
+	return (struct cedge_node *)cfg_node_alloc(allocator, size);
+}
+
+int cfg_node_allocator_init(struct cfg_node_allocator *allocator,
+			    int bb_num_esti, int cedge_num_esti)
+{
+	int s = bb_num_esti * sizeof(struct bb_node), ret;
+
+	s += 2 * bb_num_esti * sizeof(struct edge_node);
+	s += cedge_num_esti * sizeof(struct cedge_node);
+	INIT_LIST_HEAD(&allocator->pools);
+	ret = cfg_node_allocator_grow(allocator, s);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+void cfg_node_allocator_free(struct cfg_node_allocator *allocator)
+{
+	struct list_head *pools = &allocator->pools;
+	struct node_pool *pool, *tmp;
+
+	pool = first_node_pool(pools);
+	list_for_each_entry_safe_from(pool, tmp, pools, l) {
+		list_del(&pool->l);
+		kfree(pool);
+	}
+}
+
+int subprog_append_bb(struct cfg_node_allocator *allocator,
+		      struct list_head *bb_list, int head)
 {
 	struct bb_node *new_bb, *bb;
 
@@ -94,7 +200,7 @@ int subprog_append_bb(struct list_head *bb_list, int head)
 	}
 
 	bb = bb_prev(bb);
-	new_bb = kzalloc(sizeof(*new_bb), GFP_KERNEL);
+	new_bb = get_single_bb_nodes(allocator);
 	if (!new_bb)
 		return -ENOMEM;
 
@@ -106,9 +212,10 @@ int subprog_append_bb(struct list_head *bb_list, int head)
 	return 0;
 }
 
-int subprog_fini_bb(struct list_head *bb_list, int subprog_end)
+int subprog_fini_bb(struct cfg_node_allocator *allocator,
+		    struct list_head *bb_list, int subprog_end)
 {
-	struct bb_node *bb = kzalloc(sizeof(*bb), GFP_KERNEL);
+	struct bb_node *bb = get_single_bb_nodes(allocator);
 
 	if (!bb)
 		return -ENOMEM;
@@ -118,7 +225,7 @@ int subprog_fini_bb(struct list_head *bb_list, int subprog_end)
 	INIT_LIST_HEAD(&bb->e_succs);
 	list_add(&bb->l, bb_list);
 
-	bb = kzalloc(sizeof(*bb), GFP_KERNEL);
+	bb = get_single_bb_nodes(allocator);
 	if (!bb)
 		return -ENOMEM;
 	/* exit bb. */
@@ -130,12 +237,13 @@ int subprog_fini_bb(struct list_head *bb_list, int subprog_end)
 	return 0;
 }
 
-int subprog_init_bb(struct list_head *bb_list, int subprog_start)
+int subprog_init_bb(struct cfg_node_allocator *allocator,
+		    struct list_head *bb_list, int subprog_start)
 {
 	int ret;
 
 	INIT_LIST_HEAD(bb_list);
-	ret = subprog_append_bb(bb_list, subprog_start);
+	ret = subprog_append_bb(allocator, bb_list, subprog_start);
 	if (ret < 0)
 		return ret;
 
@@ -154,14 +262,15 @@ static struct bb_node *search_bb_with_head(struct list_head *bb_list, int head)
 	return NULL;
 }
 
-int subprog_add_bb_edges(struct bpf_insn *insns, struct list_head *bb_list)
+int subprog_add_bb_edges(struct cfg_node_allocator *allocator,
+			 struct bpf_insn *insns, struct list_head *bb_list)
 {
 	struct bb_node *bb, *exit_bb;
 	struct edge_node *edge;
 	int bb_num;
 
 	bb = entry_bb(bb_list);
-	edge = kcalloc(2, sizeof(*edge), GFP_KERNEL);
+	edge = get_edge_nodes(allocator, 2);
 	if (!edge)
 		return -ENOMEM;
 	edge->src = bb;
@@ -186,7 +295,7 @@ int subprog_add_bb_edges(struct bpf_insn *insns, struct list_head *bb_list)
 
 		bb->idx = bb_num++;
 
-		edge = kcalloc(2, sizeof(*edge), GFP_KERNEL);
+		edge = get_edge_nodes(allocator, 2);
 		if (!edge)
 			return -ENOMEM;
 		edge->src = bb;
@@ -222,7 +331,7 @@ int subprog_add_bb_edges(struct bpf_insn *insns, struct list_head *bb_list)
 			struct bb_node *tgt;
 
 			if (!edge) {
-				edge = kcalloc(2, sizeof(*edge), GFP_KERNEL);
+				edge = get_edge_nodes(allocator, 2);
 				if (!edge)
 					return -ENOMEM;
 				edge->src = bb;
@@ -740,6 +849,7 @@ err_free:
 }
 
 int subprog_append_callee(struct bpf_verifier_env *env,
+			  struct cfg_node_allocator *allocator,
 			  struct list_head *callees_list,
 			  int caller_idx, int off)
 {
@@ -754,7 +864,7 @@ int subprog_append_callee(struct bpf_verifier_env *env,
 			return 0;
 	}
 
-	new_callee = kzalloc(sizeof(*new_callee), GFP_KERNEL);
+	new_callee = get_single_cedge_node(allocator);
 	if (!new_callee)
 		return -ENOMEM;
 
@@ -765,41 +875,11 @@ int subprog_append_callee(struct bpf_verifier_env *env,
 	return 0;
 }
 
-static void subprog_free_edge(struct bb_node *bb)
-{
-	struct list_head *succs = &bb->e_succs;
-	struct edge_node *e, *tmp;
-
-	/* prevs and succs are allocated as pair, succs is the start addr. */
-	list_for_each_entry_safe(e, tmp, succs, l) {
-		list_del(&e->l);
-		kfree(e);
-	}
-}
-
 void subprog_free(struct bpf_subprog_info *subprog, int end_idx)
 {
 	int i = 0;
 
 	for (; i <= end_idx; i++) {
-		struct list_head *callees = &subprog[i].callees;
-		struct list_head *bbs = &subprog[i].bbs;
-		struct cedge_node *callee, *tmp_callee;
-		struct bb_node *bb, *tmp, *exit;
-
-		bb = entry_bb(bbs);
-		exit = exit_bb(bbs);
-		list_for_each_entry_safe_from(bb, tmp, &exit->l, l) {
-			subprog_free_edge(bb);
-			list_del(&bb->l);
-			kfree(bb);
-		}
-
-		list_for_each_entry_safe(callee, tmp_callee, callees, l) {
-			list_del(&callee->l);
-			kfree(callee);
-		}
-
 		if (subprog[i].dtree_avail)
 			kfree(subprog[i].dtree);
 	}

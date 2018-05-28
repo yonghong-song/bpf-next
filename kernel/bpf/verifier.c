@@ -768,7 +768,10 @@ static int check_subprogs(struct bpf_verifier_env *env)
 	struct bpf_subprog_info *subprog = env->subprog_info;
 	struct list_head *cur_bb_list, *cur_callee_list;
 	struct bpf_insn *insn = env->prog->insnsi;
+	int cedge_num_esti = 0, bb_num_esti = 3;
+	struct cfg_node_allocator allocator;
 	int insn_cnt = env->prog->len;
+	u8 code;
 
 	/* Add entry function. */
 	ret = add_subprog(env, 0);
@@ -777,8 +780,18 @@ static int check_subprogs(struct bpf_verifier_env *env)
 
 	/* determine subprog starts. The end is one before the next starts */
 	for (i = 0; i < insn_cnt; i++) {
-		if (insn[i].code != (BPF_JMP | BPF_CALL))
+		code = insn[i].code;
+		if (BPF_CLASS(code) != BPF_JMP)
 			continue;
+		if (BPF_OP(code) == BPF_EXIT) {
+			if (i + 1 < insn_cnt)
+				bb_num_esti++;
+			continue;
+		}
+		if (BPF_OP(code) != BPF_CALL) {
+			bb_num_esti += 2;
+			continue;
+		}
 		if (insn[i].src_reg != BPF_PSEUDO_CALL)
 			continue;
 		if (!env->allow_ptr_leaks) {
@@ -789,6 +802,7 @@ static int check_subprogs(struct bpf_verifier_env *env)
 			verbose(env, "function calls in offloaded programs are not supported yet\n");
 			return -EINVAL;
 		}
+		cedge_num_esti++;
 		ret = add_subprog(env, i + insn[i].imm + 1);
 		if (ret < 0)
 			return ret;
@@ -809,10 +823,14 @@ static int check_subprogs(struct bpf_verifier_env *env)
 		INIT_LIST_HEAD(&subprog[i].callees);
 	}
 
+	ret = cfg_node_allocator_init(&allocator, bb_num_esti,
+				      cedge_num_esti);
+	if (ret < 0)
+		return ret;
 	subprog_start = subprog[cur_subprog].start;
 	subprog_end = subprog[cur_subprog + 1].start;
 	cur_bb_list = &subprog[cur_subprog].bbs;
-	ret = subprog_init_bb(cur_bb_list, subprog_start);
+	ret = subprog_init_bb(&allocator, cur_bb_list, subprog_start);
 	if (ret < 0)
 		goto free_nodes;
 	cur_callee_list = &env->subprog_info[cur_subprog].callees;
@@ -825,7 +843,8 @@ static int check_subprogs(struct bpf_verifier_env *env)
 
 		if (BPF_OP(code) == BPF_EXIT) {
 			if (i + 1 < subprog_end) {
-				ret = subprog_append_bb(cur_bb_list, i + 1);
+				ret = subprog_append_bb(&allocator, cur_bb_list,
+							i + 1);
 				if (ret < 0)
 					goto free_nodes;
 			}
@@ -837,6 +856,7 @@ static int check_subprogs(struct bpf_verifier_env *env)
 				int target = i + insn[i].imm + 1;
 
 				ret = subprog_append_callee(env,
+							    &allocator,
 							    cur_callee_list,
 							    cur_subprog,
 							    target);
@@ -860,12 +880,12 @@ static int check_subprogs(struct bpf_verifier_env *env)
 			goto free_nodes;
 		}
 
-		ret = subprog_append_bb(cur_bb_list, off);
+		ret = subprog_append_bb(&allocator, cur_bb_list, off);
 		if (ret < 0)
 			goto free_nodes;
 
 		if (i + 1 < subprog_end) {
-			ret = subprog_append_bb(cur_bb_list, i + 1);
+			ret = subprog_append_bb(&allocator, cur_bb_list, i + 1);
 			if (ret < 0)
 				goto free_nodes;
 		}
@@ -889,10 +909,12 @@ next:
 				goto free_nodes;
 			}
 
-			ret = subprog_fini_bb(cur_bb_list, subprog_end);
+			ret = subprog_fini_bb(&allocator, cur_bb_list,
+					      subprog_end);
 			if (ret < 0)
 				goto free_nodes;
-			ret = subprog_add_bb_edges(insn, cur_bb_list);
+			ret = subprog_add_bb_edges(&allocator, insn,
+						   cur_bb_list);
 			if (ret < 0)
 				goto free_nodes;
 			subprog[cur_subprog].bb_num = ret;
@@ -910,7 +932,7 @@ next:
 			if (cur_subprog < env->subprog_cnt) {
 				subprog_end = subprog[cur_subprog + 1].start;
 				cur_bb_list = &subprog[cur_subprog].bbs;
-				ret = subprog_init_bb(cur_bb_list,
+				ret = subprog_init_bb(&allocator, cur_bb_list,
 						      subprog_start);
 				if (ret < 0)
 					goto free_nodes;
@@ -926,6 +948,7 @@ next:
 	ret = 0;
 
 free_nodes:
+	cfg_node_allocator_free(&allocator);
 	subprog_free(subprog, cur_subprog == env->subprog_cnt ?
 				cur_subprog - 1 : cur_subprog);
 	return ret;
