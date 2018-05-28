@@ -904,6 +904,14 @@ next:
 			if (ret < 0)
 				goto free_nodes;
 			subprog[cur_subprog].bb_num = ret;
+			ret = subprog_build_dom_info(&subprog[cur_subprog]);
+			if (ret < 0)
+				goto free_nodes;
+			if (subprog_has_loop(&subprog[cur_subprog])) {
+				verbose(env, "cfg - loop detected");
+				ret = -EINVAL;
+				goto free_nodes;
+			}
 			subprog_start = subprog_end;
 			cur_subprog++;
 			if (cur_subprog < env->subprog_cnt) {

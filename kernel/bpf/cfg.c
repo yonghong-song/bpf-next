@@ -567,6 +567,28 @@ free_dominfo:
 	return ret;
 }
 
+bool subprog_has_loop(struct bpf_subprog_info *subprog)
+{
+	int lane_len = BITS_TO_LONGS(subprog->bb_num - 2);
+	struct list_head *bb_list = &subprog->bbs;
+	struct bb_node *bb, *entry_bb;
+	struct edge_node *e;
+
+	entry_bb = entry_bb(bb_list);
+	bb = bb_next(entry_bb);
+	list_for_each_entry_from(bb, &exit_bb(bb_list)->l, l)
+		list_for_each_entry(e, &bb->e_prevs, l) {
+			struct bb_node *latch = e->src;
+
+			if (latch != entry_bb &&
+			    test_bit(bb->idx,
+				     subprog->dtree + latch->idx * lane_len))
+				return true;
+		}
+
+	return false;
+}
+
 static void subprog_free_edge(struct bb_node *bb)
 {
 	struct list_head *succs = &bb->e_succs;
