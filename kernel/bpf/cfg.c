@@ -13,6 +13,12 @@
 
 #include "cfg.h"
 
+struct cedge_node {
+	struct list_head l;
+	u8 caller_idx;
+	u8 callee_idx;
+};
+
 struct edge_node {
 	struct list_head l;
 	struct bb_node *src;
@@ -639,6 +645,126 @@ int add_subprog(struct bpf_verifier_env *env, int off)
 	return 0;
 }
 
+struct callee_iter {
+	struct list_head *list_head;
+	struct cedge_node *callee;
+};
+
+#define first_callee(c_list)	list_first_entry(c_list, struct cedge_node, l)
+#define next_callee(c)		list_next_entry(c, l)
+
+static bool ci_end_p(struct callee_iter *ci)
+{
+	return &ci->callee->l == ci->list_head;
+}
+
+static void ci_next(struct callee_iter *ci)
+{
+	struct cedge_node *c = ci->callee;
+
+	ci->callee = next_callee(c);
+}
+
+#define EXPLORING	1
+#define EXPLORED	2
+int cgraph_check_recursive_unreachable(struct bpf_verifier_env *env,
+				       struct bpf_subprog_info *subprog)
+{
+	struct callee_iter *stack;
+	struct cedge_node *callee;
+	int sp = 0, idx = 0, ret;
+	struct callee_iter ci;
+	int *status;
+
+	stack = kmalloc_array(128, sizeof(struct callee_iter), GFP_KERNEL);
+	if (!stack)
+		return -ENOMEM;
+	status = kcalloc(env->subprog_cnt, sizeof(int), GFP_KERNEL);
+	if (!status) {
+		kfree(stack);
+		return -ENOMEM;
+	}
+	ci.callee = first_callee(&subprog->callees);
+	ci.list_head = &subprog->callees;
+	status[0] = EXPLORING;
+
+	while (1) {
+		while (!ci_end_p(&ci)) {
+			callee = ci.callee;
+			idx = callee->callee_idx;
+			if (status[idx] == EXPLORING) {
+				bpf_verifier_log_write(env, "cgraph - recursive call\n");
+				ret = -EINVAL;
+				goto err_free;
+			}
+
+			status[idx] = EXPLORING;
+
+			if (sp == 127) {
+				bpf_verifier_log_write(env, "cgraph - call frame too deep\n");
+				ret = -EINVAL;
+				goto err_free;
+			}
+
+			stack[sp++] = ci;
+			ci.callee = first_callee(&subprog[idx].callees);
+			ci.list_head = &subprog[idx].callees;
+		}
+
+		if (!list_empty(ci.list_head))
+			status[first_callee(ci.list_head)->caller_idx] =
+				EXPLORED;
+		else
+			/* leaf func. */
+			status[idx] = EXPLORED;
+
+		if (!sp)
+			break;
+
+		ci = stack[--sp];
+		ci_next(&ci);
+	}
+
+	for (idx = 0; idx < env->subprog_cnt; idx++)
+		if (status[idx] != EXPLORED) {
+			bpf_verifier_log_write(env, "cgraph - unreachable subprog\n");
+			ret = -EINVAL;
+			goto err_free;
+		}
+
+	ret = 0;
+err_free:
+	kfree(status);
+	kfree(stack);
+	return ret;
+}
+
+int subprog_append_callee(struct bpf_verifier_env *env,
+			  struct list_head *callees_list,
+			  int caller_idx, int off)
+{
+	int callee_idx = find_subprog(env, off);
+	struct cedge_node *new_callee, *callee;
+
+	if (callee_idx < 0)
+		return callee_idx;
+
+	list_for_each_entry(callee, callees_list, l) {
+		if (callee->callee_idx == callee_idx)
+			return 0;
+	}
+
+	new_callee = kzalloc(sizeof(*new_callee), GFP_KERNEL);
+	if (!new_callee)
+		return -ENOMEM;
+
+	new_callee->caller_idx = caller_idx;
+	new_callee->callee_idx = callee_idx;
+	list_add_tail(&new_callee->l, callees_list);
+
+	return 0;
+}
+
 static void subprog_free_edge(struct bb_node *bb)
 {
 	struct list_head *succs = &bb->e_succs;
@@ -656,7 +782,9 @@ void subprog_free(struct bpf_subprog_info *subprog, int end_idx)
 	int i = 0;
 
 	for (; i <= end_idx; i++) {
+		struct list_head *callees = &subprog[i].callees;
 		struct list_head *bbs = &subprog[i].bbs;
+		struct cedge_node *callee, *tmp_callee;
 		struct bb_node *bb, *tmp, *exit;
 
 		bb = entry_bb(bbs);
@@ -665,6 +793,11 @@ void subprog_free(struct bpf_subprog_info *subprog, int end_idx)
 			subprog_free_edge(bb);
 			list_del(&bb->l);
 			kfree(bb);
+		}
+
+		list_for_each_entry_safe(callee, tmp_callee, callees, l) {
+			list_del(&callee->l);
+			kfree(callee);
 		}
 
 		if (subprog[i].dtree_avail)

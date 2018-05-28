@@ -9,9 +9,13 @@
 #define __BPF_CFG_H__
 
 int add_subprog(struct bpf_verifier_env *env, int off);
+int cgraph_check_recursive_unreachable(struct bpf_verifier_env *env,
+				       struct bpf_subprog_info *subprog);
 int find_subprog(struct bpf_verifier_env *env, int off);
 int subprog_add_bb_edges(struct bpf_insn *insns, struct list_head *bb_list);
 int subprog_append_bb(struct list_head *bb_list, int head);
+int subprog_append_callee(struct bpf_verifier_env *env,
+			  struct list_head *bb_list, int caller_idx, int off);
 int subprog_build_dom_info(struct bpf_verifier_env *env,
 			   struct bpf_subprog_info *subprog);
 int subprog_fini_bb(struct list_head *bb_list, int subprog_end);

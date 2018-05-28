@@ -764,9 +764,9 @@ static int check_subprogs(struct bpf_verifier_env *env)
 {
 	int i, ret, subprog_start, subprog_end, off, cur_subprog = 0;
 	struct bpf_subprog_info *subprog = env->subprog_info;
+	struct list_head *cur_bb_list, *cur_callee_list;
 	struct bpf_insn *insn = env->prog->insnsi;
 	int insn_cnt = env->prog->len;
-	struct list_head *cur_bb_list;
 
 	/* Add entry function. */
 	ret = add_subprog(env, 0);
@@ -797,9 +797,15 @@ static int check_subprogs(struct bpf_verifier_env *env)
 	 */
 	subprog[env->subprog_cnt].start = insn_cnt;
 
-	if (env->log.level > 1)
-		for (i = 0; i < env->subprog_cnt; i++)
+	for (i = 0; i < env->subprog_cnt; i++) {
+		if (env->log.level > 1)
 			verbose(env, "func#%d @%d\n", i, subprog[i].start);
+
+		/* Don't init callees inside add_subprog which will sort the
+		 * array which breaks list link.
+		 */
+		INIT_LIST_HEAD(&subprog[i].callees);
+	}
 
 	subprog_start = subprog[cur_subprog].start;
 	subprog_end = subprog[cur_subprog + 1].start;
@@ -807,6 +813,7 @@ static int check_subprogs(struct bpf_verifier_env *env)
 	ret = subprog_init_bb(cur_bb_list, subprog_start);
 	if (ret < 0)
 		goto free_nodes;
+	cur_callee_list = &env->subprog_info[cur_subprog].callees;
 	/* now check that all jumps are within the same subprog */
 	for (i = 0; i < insn_cnt; i++) {
 		u8 code = insn[i].code;
@@ -823,8 +830,20 @@ static int check_subprogs(struct bpf_verifier_env *env)
 			goto next;
 		}
 
-		if (BPF_OP(code) == BPF_CALL)
+		if (BPF_OP(code) == BPF_CALL) {
+			if (insn[i].src_reg == BPF_PSEUDO_CALL) {
+				int target = i + insn[i].imm + 1;
+
+				ret = subprog_append_callee(env,
+							    cur_callee_list,
+							    cur_subprog,
+							    target);
+				if (ret < 0)
+					return ret;
+			}
+
 			goto next;
+		}
 
 		off = i + insn[i].off + 1;
 		if (off < subprog_start || off >= subprog_end) {
@@ -880,9 +899,14 @@ next:
 						      subprog_start);
 				if (ret < 0)
 					goto free_nodes;
+				cur_callee_list = &subprog[cur_subprog].callees;
 			}
 		}
 	}
+
+	ret = cgraph_check_recursive_unreachable(env, env->subprog_info);
+	if (ret < 0)
+		goto free_nodes;
 
 	ret = 0;
 
