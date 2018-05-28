@@ -178,6 +178,9 @@ struct bpf_subprog_info {
 	u32 start; /* insn idx of function entry point */
 	u16 stack_depth; /* max. stack depth used by this function */
 	struct list_head bbs; /* basic blocks list. */
+	u32 bb_num; /* total basic block num. */
+	unsigned long *dtree;
+	bool dtree_avail;
 };
 
 /* single container for all structs

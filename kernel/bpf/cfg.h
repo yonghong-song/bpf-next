@@ -10,8 +10,9 @@
 
 int subprog_add_bb_edges(struct bpf_insn *insns, struct list_head *bb_list);
 int subprog_append_bb(struct list_head *bb_list, int head);
+int subprog_build_dom_info(struct bpf_subprog_info *subprog);
 int subprog_fini_bb(struct list_head *bb_list, int subprog_end);
 int subprog_init_bb(struct list_head *bb_list, int subprog_start);
-void subprog_free_bb(struct bpf_subprog_info *subprog, int end_idx);
+void subprog_free(struct bpf_subprog_info *subprog, int end_idx);
 
 #endif

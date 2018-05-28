@@ -903,6 +903,7 @@ next:
 			ret = subprog_add_bb_edges(insn, cur_bb_list);
 			if (ret < 0)
 				goto free_nodes;
+			subprog[cur_subprog].bb_num = ret;
 			subprog_start = subprog_end;
 			cur_subprog++;
 			if (cur_subprog < env->subprog_cnt) {
@@ -919,8 +920,8 @@ next:
 	ret = 0;
 
 free_nodes:
-	subprog_free_bb(subprog, cur_subprog == env->subprog_cnt ?
-					cur_subprog - 1 : cur_subprog);
+	subprog_free(subprog, cur_subprog == env->subprog_cnt ?
+				cur_subprog - 1 : cur_subprog);
 	return ret;
 }
 
