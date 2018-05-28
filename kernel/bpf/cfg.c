@@ -6,8 +6,10 @@
  */
 
 #include <linux/bpf_verifier.h>
+#include <linux/bsearch.h>
 #include <linux/list.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 
 #include "cfg.h"
 
@@ -596,6 +598,45 @@ bool subprog_has_loop(struct bpf_subprog_info *subprog)
 		}
 
 	return false;
+}
+
+static int cmp_subprogs(const void *a, const void *b)
+{
+	return ((struct bpf_subprog_info *)a)->start -
+	       ((struct bpf_subprog_info *)b)->start;
+}
+
+int find_subprog(struct bpf_verifier_env *env, int off)
+{
+	struct bpf_subprog_info *p;
+
+	p = bsearch(&off, env->subprog_info, env->subprog_cnt,
+		    sizeof(env->subprog_info[0]), cmp_subprogs);
+	if (!p)
+		return -ENOENT;
+	return p - env->subprog_info;
+}
+
+int add_subprog(struct bpf_verifier_env *env, int off)
+{
+	int insn_cnt = env->prog->len;
+	int ret;
+
+	if (off >= insn_cnt || off < 0) {
+		bpf_verifier_log_write(env, "call to invalid destination\n");
+		return -EINVAL;
+	}
+	ret = find_subprog(env, off);
+	if (ret >= 0)
+		return 0;
+	if (env->subprog_cnt >= BPF_MAX_SUBPROGS) {
+		bpf_verifier_log_write(env, "too many subprograms\n");
+		return -E2BIG;
+	}
+	env->subprog_info[env->subprog_cnt++].start = off;
+	sort(env->subprog_info, env->subprog_cnt,
+	     sizeof(env->subprog_info[0]), cmp_subprogs, NULL);
+	return 0;
 }
 
 static void subprog_free_edge(struct bb_node *bb)

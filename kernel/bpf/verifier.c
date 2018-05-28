@@ -20,8 +20,6 @@
 #include <linux/file.h>
 #include <linux/vmalloc.h>
 #include <linux/stringify.h>
-#include <linux/bsearch.h>
-#include <linux/sort.h>
 #include <linux/perf_event.h>
 
 #include "cfg.h"
@@ -761,46 +759,6 @@ enum reg_arg_type {
 	DST_OP,		/* register is used as destination operand */
 	DST_OP_NO_MARK	/* same as above, check only, don't mark */
 };
-
-static int cmp_subprogs(const void *a, const void *b)
-{
-	return ((struct bpf_subprog_info *)a)->start -
-	       ((struct bpf_subprog_info *)b)->start;
-}
-
-static int find_subprog(struct bpf_verifier_env *env, int off)
-{
-	struct bpf_subprog_info *p;
-
-	p = bsearch(&off, env->subprog_info, env->subprog_cnt,
-		    sizeof(env->subprog_info[0]), cmp_subprogs);
-	if (!p)
-		return -ENOENT;
-	return p - env->subprog_info;
-
-}
-
-static int add_subprog(struct bpf_verifier_env *env, int off)
-{
-	int insn_cnt = env->prog->len;
-	int ret;
-
-	if (off >= insn_cnt || off < 0) {
-		verbose(env, "call to invalid destination\n");
-		return -EINVAL;
-	}
-	ret = find_subprog(env, off);
-	if (ret >= 0)
-		return 0;
-	if (env->subprog_cnt >= BPF_MAX_SUBPROGS) {
-		verbose(env, "too many subprograms\n");
-		return -E2BIG;
-	}
-	env->subprog_info[env->subprog_cnt++].start = off;
-	sort(env->subprog_info, env->subprog_cnt,
-	     sizeof(env->subprog_info[0]), cmp_subprogs, NULL);
-	return 0;
-}
 
 static int check_subprogs(struct bpf_verifier_env *env)
 {
