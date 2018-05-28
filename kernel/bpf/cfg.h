@@ -8,6 +8,7 @@
 #ifndef __BPF_CFG_H__
 #define __BPF_CFG_H__
 
+int subprog_add_bb_edges(struct bpf_insn *insns, struct list_head *bb_list);
 int subprog_append_bb(struct list_head *bb_list, int head);
 int subprog_fini_bb(struct list_head *bb_list, int subprog_end);
 int subprog_init_bb(struct list_head *bb_list, int subprog_start);
