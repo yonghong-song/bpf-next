@@ -760,6 +760,8 @@ enum reg_arg_type {
 	DST_OP_NO_MARK	/* same as above, check only, don't mark */
 };
 
+#define STATE_LIST_MARK ((struct bpf_verifier_state_list *)-1L)
+
 static int check_subprogs(struct bpf_verifier_env *env)
 {
 	int i, ret, subprog_start, subprog_end, off, cur_subprog = 0;
@@ -840,7 +842,13 @@ static int check_subprogs(struct bpf_verifier_env *env)
 							    target);
 				if (ret < 0)
 					return ret;
+
+				env->explored_states[target] = STATE_LIST_MARK;
+				env->explored_states[i] = STATE_LIST_MARK;
 			}
+
+			if (i + 1 < insn_cnt)
+				env->explored_states[i + 1] = STATE_LIST_MARK;
 
 			goto next;
 		}
@@ -860,6 +868,13 @@ static int check_subprogs(struct bpf_verifier_env *env)
 			ret = subprog_append_bb(cur_bb_list, i + 1);
 			if (ret < 0)
 				goto free_nodes;
+		}
+
+		if (BPF_OP(code) != BPF_JA) {
+			env->explored_states[i] = STATE_LIST_MARK;
+			env->explored_states[off] = STATE_LIST_MARK;
+		} else if (i + 1 < insn_cnt) {
+			env->explored_states[i + 1] = STATE_LIST_MARK;
 		}
 next:
 		if (i == subprog_end - 1) {
@@ -4093,217 +4108,6 @@ static int check_return_code(struct bpf_verifier_env *env)
 	return 0;
 }
 
-/* non-recursive DFS pseudo code
- * 1  procedure DFS-iterative(G,v):
- * 2      label v as discovered
- * 3      let S be a stack
- * 4      S.push(v)
- * 5      while S is not empty
- * 6            t <- S.pop()
- * 7            if t is what we're looking for:
- * 8                return t
- * 9            for all edges e in G.adjacentEdges(t) do
- * 10               if edge e is already labelled
- * 11                   continue with the next edge
- * 12               w <- G.adjacentVertex(t,e)
- * 13               if vertex w is not discovered and not explored
- * 14                   label e as tree-edge
- * 15                   label w as discovered
- * 16                   S.push(w)
- * 17                   continue at 5
- * 18               else if vertex w is discovered
- * 19                   label e as back-edge
- * 20               else
- * 21                   // vertex w is explored
- * 22                   label e as forward- or cross-edge
- * 23           label t as explored
- * 24           S.pop()
- *
- * convention:
- * 0x10 - discovered
- * 0x11 - discovered and fall-through edge labelled
- * 0x12 - discovered and fall-through and branch edges labelled
- * 0x20 - explored
- */
-
-enum {
-	DISCOVERED = 0x10,
-	EXPLORED = 0x20,
-	FALLTHROUGH = 1,
-	BRANCH = 2,
-};
-
-#define STATE_LIST_MARK ((struct bpf_verifier_state_list *) -1L)
-
-static int *insn_stack;	/* stack of insns to process */
-static int cur_stack;	/* current stack index */
-static int *insn_state;
-
-/* t, w, e - match pseudo-code above:
- * t - index of current instruction
- * w - next instruction
- * e - edge
- */
-static int push_insn(int t, int w, int e, struct bpf_verifier_env *env)
-{
-	if (e == FALLTHROUGH && insn_state[t] >= (DISCOVERED | FALLTHROUGH))
-		return 0;
-
-	if (e == BRANCH && insn_state[t] >= (DISCOVERED | BRANCH))
-		return 0;
-
-	if (w < 0 || w >= env->prog->len) {
-		verbose(env, "jump out of range from insn %d to %d\n", t, w);
-		return -EINVAL;
-	}
-
-	if (e == BRANCH)
-		/* mark branch target for state pruning */
-		env->explored_states[w] = STATE_LIST_MARK;
-
-	if (insn_state[w] == 0) {
-		/* tree-edge */
-		insn_state[t] = DISCOVERED | e;
-		insn_state[w] = DISCOVERED;
-		if (cur_stack >= env->prog->len)
-			return -E2BIG;
-		insn_stack[cur_stack++] = w;
-		return 1;
-	} else if ((insn_state[w] & 0xF0) == DISCOVERED) {
-		verbose(env, "back-edge from insn %d to %d\n", t, w);
-		return -EINVAL;
-	} else if (insn_state[w] == EXPLORED) {
-		/* forward- or cross-edge */
-		insn_state[t] = DISCOVERED | e;
-	} else {
-		verbose(env, "insn state internal bug\n");
-		return -EFAULT;
-	}
-	return 0;
-}
-
-/* non-recursive depth-first-search to detect loops in BPF program
- * loop == back-edge in directed graph
- */
-static int check_cfg(struct bpf_verifier_env *env)
-{
-	struct bpf_insn *insns = env->prog->insnsi;
-	int insn_cnt = env->prog->len;
-	int ret = 0;
-	int i, t;
-
-	ret = check_subprogs(env);
-	if (ret < 0)
-		return ret;
-
-	insn_state = kcalloc(insn_cnt, sizeof(int), GFP_KERNEL);
-	if (!insn_state)
-		return -ENOMEM;
-
-	insn_stack = kcalloc(insn_cnt, sizeof(int), GFP_KERNEL);
-	if (!insn_stack) {
-		kfree(insn_state);
-		return -ENOMEM;
-	}
-
-	insn_state[0] = DISCOVERED; /* mark 1st insn as discovered */
-	insn_stack[0] = 0; /* 0 is the first instruction */
-	cur_stack = 1;
-
-peek_stack:
-	if (cur_stack == 0)
-		goto check_state;
-	t = insn_stack[cur_stack - 1];
-
-	if (BPF_CLASS(insns[t].code) == BPF_JMP) {
-		u8 opcode = BPF_OP(insns[t].code);
-
-		if (opcode == BPF_EXIT) {
-			goto mark_explored;
-		} else if (opcode == BPF_CALL) {
-			ret = push_insn(t, t + 1, FALLTHROUGH, env);
-			if (ret == 1)
-				goto peek_stack;
-			else if (ret < 0)
-				goto err_free;
-			if (t + 1 < insn_cnt)
-				env->explored_states[t + 1] = STATE_LIST_MARK;
-			if (insns[t].src_reg == BPF_PSEUDO_CALL) {
-				env->explored_states[t] = STATE_LIST_MARK;
-				ret = push_insn(t, t + insns[t].imm + 1, BRANCH, env);
-				if (ret == 1)
-					goto peek_stack;
-				else if (ret < 0)
-					goto err_free;
-			}
-		} else if (opcode == BPF_JA) {
-			if (BPF_SRC(insns[t].code) != BPF_K) {
-				ret = -EINVAL;
-				goto err_free;
-			}
-			/* unconditional jump with single edge */
-			ret = push_insn(t, t + insns[t].off + 1,
-					FALLTHROUGH, env);
-			if (ret == 1)
-				goto peek_stack;
-			else if (ret < 0)
-				goto err_free;
-			/* tell verifier to check for equivalent states
-			 * after every call and jump
-			 */
-			if (t + 1 < insn_cnt)
-				env->explored_states[t + 1] = STATE_LIST_MARK;
-		} else {
-			/* conditional jump with two edges */
-			env->explored_states[t] = STATE_LIST_MARK;
-			ret = push_insn(t, t + 1, FALLTHROUGH, env);
-			if (ret == 1)
-				goto peek_stack;
-			else if (ret < 0)
-				goto err_free;
-
-			ret = push_insn(t, t + insns[t].off + 1, BRANCH, env);
-			if (ret == 1)
-				goto peek_stack;
-			else if (ret < 0)
-				goto err_free;
-		}
-	} else {
-		/* all other non-branch instructions with single
-		 * fall-through edge
-		 */
-		ret = push_insn(t, t + 1, FALLTHROUGH, env);
-		if (ret == 1)
-			goto peek_stack;
-		else if (ret < 0)
-			goto err_free;
-	}
-
-mark_explored:
-	insn_state[t] = EXPLORED;
-	if (cur_stack-- <= 0) {
-		verbose(env, "pop stack internal bug\n");
-		ret = -EFAULT;
-		goto err_free;
-	}
-	goto peek_stack;
-
-check_state:
-	for (i = 0; i < insn_cnt; i++) {
-		if (insn_state[i] != EXPLORED) {
-			verbose(env, "unreachable insn %d\n", i);
-			ret = -EINVAL;
-			goto err_free;
-		}
-	}
-	ret = 0; /* cfg looks good */
-
-err_free:
-	kfree(insn_state);
-	kfree(insn_stack);
-	return ret;
-}
-
 /* check %cur's range satisfies %old's */
 static bool range_within(struct bpf_reg_state *old,
 			 struct bpf_reg_state *cur)
@@ -5914,7 +5718,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr)
 
 	env->allow_ptr_leaks = capable(CAP_SYS_ADMIN);
 
-	ret = check_cfg(env);
+	ret = check_subprogs(env);
 	if (ret < 0)
 		goto skip_full_check;
 
