@@ -766,9 +766,9 @@ static int check_subprogs(struct bpf_verifier_env *env)
 {
 	int i, ret, subprog_start, subprog_end, off, cur_subprog = 0;
 	struct bpf_subprog_info *subprog = env->subprog_info;
-	struct list_head *cur_bb_list, *cur_callee_list;
 	struct bpf_insn *insn = env->prog->insnsi;
 	int cedge_num_esti = 0, bb_num_esti = 3;
+	void **cur_bb_list, **cur_callee_list;
 	struct cfg_node_allocator allocator;
 	int insn_cnt = env->prog->len;
 	u8 code;
@@ -813,15 +813,9 @@ static int check_subprogs(struct bpf_verifier_env *env)
 	 */
 	subprog[env->subprog_cnt].start = insn_cnt;
 
-	for (i = 0; i < env->subprog_cnt; i++) {
+	for (i = 0; i < env->subprog_cnt; i++)
 		if (env->log.level > 1)
 			verbose(env, "func#%d @%d\n", i, subprog[i].start);
-
-		/* Don't init callees inside add_subprog which will sort the
-		 * array which breaks list link.
-		 */
-		INIT_LIST_HEAD(&subprog[i].callees);
-	}
 
 	ret = cfg_node_allocator_init(&allocator, bb_num_esti,
 				      cedge_num_esti);
@@ -829,8 +823,9 @@ static int check_subprogs(struct bpf_verifier_env *env)
 		return ret;
 	subprog_start = subprog[cur_subprog].start;
 	subprog_end = subprog[cur_subprog + 1].start;
-	cur_bb_list = &subprog[cur_subprog].bbs;
-	ret = subprog_init_bb(&allocator, cur_bb_list, subprog_start);
+	cur_bb_list = (void **)&subprog[cur_subprog].bbs;
+	ret = subprog_init_bb(&allocator, cur_bb_list, subprog_start,
+			      subprog_end);
 	if (ret < 0)
 		goto free_nodes;
 	cur_callee_list = &env->subprog_info[cur_subprog].callees;
@@ -909,20 +904,17 @@ next:
 				goto free_nodes;
 			}
 
-			ret = subprog_fini_bb(&allocator, cur_bb_list,
-					      subprog_end);
-			if (ret < 0)
-				goto free_nodes;
 			ret = subprog_add_bb_edges(&allocator, insn,
 						   cur_bb_list);
 			if (ret < 0)
 				goto free_nodes;
 			subprog[cur_subprog].bb_num = ret;
-			ret = subprog_build_dom_info(env,
+			ret = subprog_build_dom_info(env, &allocator,
 						     &subprog[cur_subprog]);
 			if (ret < 0)
 				goto free_nodes;
-			if (subprog_has_loop(&subprog[cur_subprog])) {
+			if (subprog_has_loop(&allocator,
+					     &subprog[cur_subprog])) {
 				verbose(env, "cfg - loop detected");
 				ret = -EINVAL;
 				goto free_nodes;
@@ -931,9 +923,11 @@ next:
 			cur_subprog++;
 			if (cur_subprog < env->subprog_cnt) {
 				subprog_end = subprog[cur_subprog + 1].start;
-				cur_bb_list = &subprog[cur_subprog].bbs;
+				cur_bb_list =
+					(void **)&subprog[cur_subprog].bbs;
 				ret = subprog_init_bb(&allocator, cur_bb_list,
-						      subprog_start);
+						      subprog_start,
+						      subprog_end);
 				if (ret < 0)
 					goto free_nodes;
 				cur_callee_list = &subprog[cur_subprog].callees;
@@ -941,7 +935,8 @@ next:
 		}
 	}
 
-	ret = cgraph_check_recursive_unreachable(env, env->subprog_info);
+	ret = cgraph_check_recursive_unreachable(env, &allocator,
+						 env->subprog_info);
 	if (ret < 0)
 		goto free_nodes;
 

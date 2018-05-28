@@ -177,8 +177,11 @@ static inline bool bpf_verifier_log_needed(const struct bpf_verifier_log *log)
 struct bpf_subprog_info {
 	u32 start; /* insn idx of function entry point */
 	u16 stack_depth; /* max. stack depth used by this function */
-	struct list_head callees; /* callees list. */
-	struct list_head bbs; /* basic blocks list. */
+	void *callees; /* callees list. */
+	struct {
+		void *entry_bb; /* basic blocks list head. */
+		void *exit_bb; /* basic blocks list tail. */
+	} bbs;
 	u32 bb_num; /* total basic block num. */
 	unsigned long *dtree;
 	bool dtree_avail;
