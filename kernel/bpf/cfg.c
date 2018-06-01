@@ -62,6 +62,60 @@ static struct bb_node *bb_next(struct cfg_node_allocator *allocator,
 	return (struct bb_node *)cfg_node_delink(allocator, &bb->link);
 }
 
+void cfg_pretty_print(struct bpf_verifier_env *env,
+		      struct cfg_node_allocator *allocator,
+		      struct bpf_subprog_info *subprog)
+{
+	void **bb_list = (void **)&subprog->bbs;
+	struct bb_node *bb, *exit_bb;
+
+	bb = entry_bb(bb_list);
+	exit_bb = exit_bb(bb_list);
+
+	bpf_verifier_log_write(env, "CFG: ");
+	while (bb && bb != exit_bb) {
+		struct bb_node *next_bb = bb_next(allocator, bb);
+		struct edge_node *e;
+
+		e = cfg_node_delink(allocator, &bb->e_succs);
+		while (e) {
+			struct bb_node *dst = e->dst;
+			int tail = next_bb->head - 1;
+			struct bb_node *dst_next;
+			int dst_tail;
+
+			dst_next = bb_next(allocator, dst);
+			dst_tail = dst_next ? dst_next->head - 1 : 65534;
+
+			bpf_verifier_log_write(env, " %i[%i,%i] -> %i[%i,%i] ",
+					       bb->idx, bb->head, tail, dst->idx, dst->head, dst_tail);
+			e = cfg_node_delink(allocator, &e->link);
+		}
+		bb = bb_next(allocator, bb);
+	}
+	bpf_verifier_log_write(env, "\n");
+}
+
+void dom_pretty_print(struct bpf_verifier_env *env,
+		      struct bpf_subprog_info *subprog)
+{
+	int lane_len, bb_num = subprog->bb_num - 2;
+	int i, j;
+
+	lane_len = BITS_TO_LONGS(bb_num);
+
+	bpf_verifier_log_write(env, "DOM:\n");
+	for (i = 0; i < bb_num; i++) {
+		for (j = 0; j < bb_num; j++) {
+			bpf_verifier_log_write(env, " %i ",
+			    test_bit(j,
+				     subprog->dtree + i * lane_len) ? 1 : 0);
+		}
+		bpf_verifier_log_write(env, "\n");
+	}
+	bpf_verifier_log_write(env, "\n");
+}
+
 struct dom_info {
 	u16 *dfs_parent;
 	u16 *dfs_order;

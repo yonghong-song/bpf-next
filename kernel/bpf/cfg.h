@@ -37,6 +37,11 @@ bool subprog_has_loop(struct cfg_node_allocator *allocator,
 		      struct bpf_subprog_info *subprog);
 int subprog_has_irreduciable_loop(struct cfg_node_allocator *allocator,
 				  struct bpf_subprog_info *subprog);
+void cfg_pretty_print(struct bpf_verifier_env *env,
+		      struct cfg_node_allocator *allocator,
+		      struct bpf_subprog_info *subprog);
+void dom_pretty_print(struct bpf_verifier_env *env,
+		      struct bpf_subprog_info *subprog);
 int subprog_init_bb(struct cfg_node_allocator *allocator, void **bb_list,
 		    int subprog_start, int subprog_end);
 void subprog_free(struct bpf_subprog_info *subprog, int end_idx);

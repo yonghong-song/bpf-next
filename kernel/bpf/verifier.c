@@ -913,6 +913,8 @@ next:
 						     &subprog[cur_subprog]);
 			if (ret < 0)
 				goto free_nodes;
+			cfg_pretty_print(env, &allocator, &subprog[cur_subprog]);
+			dom_pretty_print(env, &subprog[cur_subprog]);
 			ret = subprog_has_irreduciable_loop(&allocator,
 							&subprog[cur_subprog]);
 			if (ret < 0)
