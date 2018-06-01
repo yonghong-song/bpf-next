@@ -2830,8 +2830,10 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 		dst_reg->off = ptr_reg->off;
 		if (reg_is_pkt_pointer(ptr_reg)) {
 			dst_reg->id = ++env->id_gen;
-			/* something was added to pkt_ptr, set range to zero */
-			dst_reg->range = 0;
+			if (umax_val > dst_reg->range)
+				dst_reg->range = 0;
+			else
+				dst_reg->range -= umax_val;
 		}
 		break;
 	case BPF_SUB:
