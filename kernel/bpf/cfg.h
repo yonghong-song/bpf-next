@@ -15,6 +15,8 @@ struct cfg_node_allocator {
 	u8 pool_cnt;
 };
 
+struct bpf_loop_info;
+
 int add_subprog(struct bpf_verifier_env *env, int off);
 void cfg_node_allocator_free(struct cfg_node_allocator *allocator);
 int cfg_node_allocator_init(struct cfg_node_allocator *allocator,
@@ -33,8 +35,9 @@ int subprog_append_callee(struct bpf_verifier_env *env,
 int subprog_build_dom_info(struct bpf_verifier_env *env,
 			   struct cfg_node_allocator *allocator,
 			   struct bpf_subprog_info *subprog);
-bool subprog_has_loop(struct cfg_node_allocator *allocator,
-		      struct bpf_subprog_info *subprog);
+int subprog_has_loop(struct bpf_verifier_env *env,
+		     struct cfg_node_allocator *allocator,
+		     struct bpf_subprog_info *subprog);
 int subprog_has_irreduciable_loop(struct cfg_node_allocator *allocator,
 				  struct bpf_subprog_info *subprog);
 void cfg_pretty_print(struct bpf_verifier_env *env,
@@ -45,6 +48,7 @@ void dom_pretty_print(struct bpf_verifier_env *env,
 int subprog_init_bb(struct cfg_node_allocator *allocator, void **bb_list,
 		    int subprog_start, int subprog_end);
 void subprog_free(struct bpf_subprog_info *subprog, int end_idx);
+int bpf_check_loop_header(struct bpf_verifier_env *env, int insn_idx);
 
 #define DFS_NODE_EXPLORING	1
 #define DFS_NODE_EXPLORED	2

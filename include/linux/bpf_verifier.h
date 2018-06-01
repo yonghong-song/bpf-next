@@ -40,6 +40,14 @@ enum bpf_reg_liveness {
 	REG_LIVE_WRITTEN, /* reg was written first, screening off later reads */
 };
 
+enum bpf_indvar_state {
+	BPF_LOOP_UNKNOWN,
+	BPF_LOOP_INVALID,
+	BPF_LOOP_IMM,
+	BPF_LOOP_INC,
+	BPF_LOOP_DEC,
+};
+
 struct bpf_reg_state {
 	enum bpf_reg_type type;
 	union {
@@ -81,9 +89,17 @@ struct bpf_reg_state {
 	 * while another to the caller's stack. To differentiate them 'frameno'
 	 * is used which is an index in bpf_verifier_state->frame[] array
 	 * pointing to bpf_func_state.
-	 * This field must be second to last, for states_equal() reasons.
+	 * This field marks the offset for comparisons in state pruning, review
+	 * states_equal() for specifics.
 	 */
 	u32 frameno;
+
+	/* Used to determine if this reg state is tracking an induction variable
+	 * through a loop. Induction variables have worst case values for all
+	 * iterations of the loop.
+	 */
+	enum bpf_indvar_state indvar;
+
 	/* This field must be last, for states_equal() reasons. */
 	enum bpf_reg_liveness live;
 };
@@ -139,6 +155,7 @@ struct bpf_verifier_state_list {
 	struct bpf_verifier_state_list *next;
 };
 
+struct bpf_loop_info;
 struct bpf_insn_aux_data {
 	union {
 		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
@@ -148,6 +165,7 @@ struct bpf_insn_aux_data {
 	int ctx_field_size; /* the ctx field size for load insn, maybe 0 */
 	int sanitize_stack_off; /* stack slot to be cleared */
 	bool seen; /* this insn was processed by the verifier */
+	struct bpf_loop_info *loop; /* when set this insn marks loop header */
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */

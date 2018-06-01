@@ -687,6 +687,7 @@ static void __mark_reg_unknown(struct bpf_reg_state *reg)
 	reg->off = 0;
 	reg->var_off = tnum_unknown;
 	reg->frameno = 0;
+	reg->indvar = BPF_LOOP_UNKNOWN;
 	__mark_reg_unbounded(reg);
 }
 
@@ -913,6 +914,7 @@ next:
 						     &subprog[cur_subprog]);
 			if (ret < 0)
 				goto free_nodes;
+
 			cfg_pretty_print(env, &allocator, &subprog[cur_subprog]);
 			dom_pretty_print(env, &subprog[cur_subprog]);
 			ret = subprog_has_irreduciable_loop(&allocator,
@@ -924,7 +926,8 @@ next:
 				ret = -EINVAL;
 				goto free_nodes;
 			}
-			if (subprog_has_loop(&allocator,
+			if (subprog_has_loop(env,
+					     &allocator,
 					     &subprog[cur_subprog])) {
 				verbose(env, "cfg - loop detected");
 				ret = -EINVAL;
@@ -1117,7 +1120,8 @@ static int check_stack_write(struct bpf_verifier_env *env,
 
 	cur = env->cur_state->frame[env->cur_state->curframe];
 	if (value_regno >= 0 &&
-	    is_spillable_regtype((type = cur->regs[value_regno].type))) {
+	    (is_spillable_regtype((type = cur->regs[value_regno].type)) ||
+	    cur->regs[value_regno].indvar)) {
 
 		/* register containing pointer is being spilled into stack */
 		if (size != BPF_REG_SIZE) {
@@ -2784,6 +2788,13 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 	    !check_reg_sane_offset(env, ptr_reg, ptr_reg->type))
 		return -EINVAL;
 
+	/* For now if indvar is being used with a pointer and scalar drop the
+	 * indvar. This will force the loop to run until termination without
+	 * the aid of pruning. With extra complexity this can be added in the
+	 * future if needed.
+	 */
+	dst_reg->indvar = BPF_LOOP_UNKNOWN;
+
 	switch (opcode) {
 	case BPF_ADD:
 		/* We can take a fixed offset as long as it doesn't overflow
@@ -2809,6 +2820,8 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 		 * this creates a new 'base' pointer, off_reg (variable) gets
 		 * added into the variable offset, and we copy the fixed offset
 		 * from ptr_reg.
+		 * For PTR_TO_PACJET ptrs we propagate range through when
+		 * possible by taking worst case upper limit.
 		 */
 		if (signed_add_overflows(smin_ptr, smin_val) ||
 		    signed_add_overflows(smax_ptr, smax_val)) {
@@ -2956,6 +2969,13 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 		return 0;
 	}
 
+	/* Verifier check to ensure indvar state is good */
+	if (dst_reg->indvar && opcode != BPF_ADD && opcode != BPF_SUB) {
+		WARN_ON_ONCE(1);
+		__mark_reg_unknown(dst_reg);
+		return 0;
+	}
+
 	switch (opcode) {
 	case BPF_ADD:
 		if (signed_add_overflows(dst_reg->smin_value, smin_val) ||
@@ -2963,18 +2983,37 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 			dst_reg->smin_value = S64_MIN;
 			dst_reg->smax_value = S64_MAX;
 		} else {
-			dst_reg->smin_value += smin_val;
-			dst_reg->smax_value += smax_val;
+			if (dst_reg->indvar == BPF_LOOP_INC) {
+				dst_reg->smin_value += smin_val;
+			} else if (dst_reg->indvar == BPF_LOOP_DEC) {
+				dst_reg->smax_value += smax_val;
+			} else {
+				dst_reg->smin_value += smin_val;
+				dst_reg->smax_value += smax_val;
+			}
 		}
 		if (dst_reg->umin_value + umin_val < umin_val ||
 		    dst_reg->umax_value + umax_val < umax_val) {
 			dst_reg->umin_value = 0;
 			dst_reg->umax_value = U64_MAX;
 		} else {
-			dst_reg->umin_value += umin_val;
-			dst_reg->umax_value += umax_val;
+			if (dst_reg->indvar == BPF_LOOP_INC) {
+				dst_reg->umin_value += umin_val;
+			} else if (dst_reg->indvar == BPF_LOOP_DEC) {
+				dst_reg->umax_value += smax_val;
+			} else {
+				dst_reg->umin_value += umin_val;
+				dst_reg->umax_value += umax_val;
+			}
 		}
-		dst_reg->var_off = tnum_add(dst_reg->var_off, src_reg.var_off);
+
+		/* This is a hack for now need to sort out tnum when manipulating
+		 * min/max bounds directly.
+		 */
+		if (dst_reg->indvar)
+			dst_reg->var_off = tnum_range(dst_reg->umin_value, dst_reg->umax_value);
+		else
+			dst_reg->var_off = tnum_add(dst_reg->var_off, src_reg.var_off);
 		break;
 	case BPF_SUB:
 		if (signed_sub_overflows(dst_reg->smin_value, smax_val) ||
@@ -2983,8 +3022,14 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 			dst_reg->smin_value = S64_MIN;
 			dst_reg->smax_value = S64_MAX;
 		} else {
-			dst_reg->smin_value -= smax_val;
-			dst_reg->smax_value -= smin_val;
+			if (dst_reg->indvar == BPF_LOOP_INC) {
+				dst_reg->smin_value -= smax_val;
+			} else if (dst_reg->indvar == BPF_LOOP_DEC) {
+				dst_reg->smax_value -= smin_val;
+			} else {
+				dst_reg->smin_value -= smax_val;
+				dst_reg->smax_value -= smin_val;
+			}
 		}
 		if (dst_reg->umin_value < umax_val) {
 			/* Overflow possible, we know nothing */
@@ -2992,10 +3037,23 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 			dst_reg->umax_value = U64_MAX;
 		} else {
 			/* Cannot overflow (as long as bounds are consistent) */
-			dst_reg->umin_value -= umax_val;
-			dst_reg->umax_value -= umin_val;
+			if (dst_reg->indvar == BPF_LOOP_INC) {
+				dst_reg->umin_value -= umax_val;
+			} else if (dst_reg->indvar == BPF_LOOP_DEC) {
+				dst_reg->umax_value -= umin_val;
+			} else {
+				dst_reg->umin_value -= umax_val;
+				dst_reg->umax_value -= umin_val;
+			}
 		}
-		dst_reg->var_off = tnum_sub(dst_reg->var_off, src_reg.var_off);
+
+		/* This is a hack for now need to sort out tnum when manipulating
+		 * min/max bounds directly.
+		 */
+		if (dst_reg->indvar)
+			dst_reg->var_off = tnum_range(dst_reg->umin_value, dst_reg->umax_value);
+		else
+			dst_reg->var_off = tnum_sub(dst_reg->var_off, src_reg.var_off);
 		break;
 	case BPF_MUL:
 		dst_reg->var_off = tnum_mul(dst_reg->var_off, src_reg.var_off);
@@ -3167,6 +3225,10 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 	}
 
 	if (BPF_CLASS(insn->code) != BPF_ALU64) {
+		/* Not tracking 32-bit ALU ops for now */
+		dst_reg->indvar = BPF_LOOP_UNKNOWN;
+		src_reg.indvar = BPF_LOOP_UNKNOWN;
+
 		/* 32-bit ALU ops are (32,32)->32 */
 		coerce_reg_to_size(dst_reg, 4);
 		coerce_reg_to_size(&src_reg, 4);
@@ -3199,7 +3261,9 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
 			if (dst_reg->type != SCALAR_VALUE) {
 				/* Combining two pointers by any ALU op yields
 				 * an arbitrary scalar. Disallow all math except
-				 * pointer subtraction
+				 * pointer subtraction. Further we do not track
+				 * indvar through pointer ALU, so likely to hit
+				 * complexity limits with pointer loop indvar.
 				 */
 				if (opcode == BPF_SUB){
 					mark_reg_unknown(env, regs, insn->dst_reg);
@@ -4862,6 +4926,14 @@ process_bpf_exit:
 		} else {
 			verbose(env, "unknown insn class %d\n", class);
 			return -EINVAL;
+		}
+
+		err = bpf_check_loop_header(env, insn_idx);
+		if (err < 0) {
+			print_verifier_state(env, state->frame[state->curframe]);
+			return err;
+		} else if (err > 0) {
+			print_verifier_state(env, state->frame[state->curframe]);
 		}
 
 		insn_idx++;

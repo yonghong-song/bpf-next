@@ -11,6 +11,7 @@
  */
 #include <uapi/linux/bpf.h>
 #include <uapi/linux/pkt_cls.h>
+#include <linux/version.h>
 
 #include "bpf_helpers.h"
 
@@ -34,6 +35,13 @@ int _xdp_mark(struct xdp_md *ctx)
 	struct meta_info *meta;
 	void *data, *data_end;
 	int ret;
+	volatile __u64 v[4];
+
+	v[0] = 0;
+	v[1] = 1;
+	v[2] = 2;
+	v[3] = 3;
+
 
 	/* Reserve space in-front of data pointer for our meta info.
 	 * (Notice drivers not supporting data_meta will fail here!)
@@ -59,26 +67,61 @@ int _xdp_mark(struct xdp_md *ctx)
 	return XDP_PASS;
 }
 
-SEC("tc_mark")
+SEC("classifier_tc_mark")
 int _tc_mark(struct __sk_buff *ctx)
 {
 	void *data      = (void *)(unsigned long)ctx->data;
 	void *data_end  = (void *)(unsigned long)ctx->data_end;
+	char a = 'a';
+#if 0
 	void *data_meta = (void *)(unsigned long)ctx->data_meta;
 	struct meta_info *meta = data_meta;
+	volatile __u64 mark = ctx->mark;
+#endif
 
 	/* Check XDP gave us some data_meta */
-	if (meta + 1 > data) {
-		ctx->mark = 41;
-		 /* Skip "accept" if no data_meta is avail */
-		return TC_ACT_OK;
-	}
+	 u8 j = 0;
+	 s32 i = 0;
+	 u8 k = 0;
+	 u8 *p;
+	
+	 if (data + 2 > data_end)
+		 return TC_ACT_OK;
 
+	 p = data;
+	 j = p[0]; 
+
+	 if (data + 111 > data_end)
+		 return TC_ACT_OK;
+
+	 if (j > 100)
+		 return TC_ACT_OK;
+#if 0
+	 if (j < 10)
+		 return TC_ACT_OK;
+#endif
+
+#pragma nounroll
+	while (i < j) {
+		//j1 = j2 = j3 = j4 = j5 = j6 = j7 = j8 = j9 = j10 = 1;
+		//k += (__u8)p[i];
+		k += p[i];
+		i++;
+#if 0
+		else 
+			p[i] = 'b';
+#endif
+
+		//j++;
+	}
 	/* Hint: See func tc_cls_act_is_valid_access() for BPF_WRITE access */
-	ctx->mark = meta->mark; /* Transfer XDP-mark to SKB-mark */
+	//ctx->mark = meta->mark; /* Transfer XDP-mark to SKB-mark */
+	ctx->mark = k;
 
 	return TC_ACT_OK;
 }
+
+u32 _version SEC("version") = LINUX_VERSION_CODE;
 
 /* Manually attaching these programs:
 export DEV=ixgbe2

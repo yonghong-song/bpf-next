@@ -12,6 +12,7 @@
 #include <linux/sort.h>
 
 #include "cfg.h"
+#include "disasm.h"
 
 /* The size of cfg nodes matters, therefore we try to avoid using doubly linked
  * list and we try to use base + offset to address node, by this we only need
@@ -52,6 +53,64 @@ struct bb_node {
 	s16 head;
 	u16 idx;
 };
+
+struct bb_node_stack {
+	struct bb_node *bb;
+	struct list_head list;
+};
+
+static const char * const bpf_loop_state_str[] = {
+	[BPF_LOOP_UNKNOWN]	= "unknown",
+	[BPF_LOOP_INVALID]	= "invalid",
+	[BPF_LOOP_IMM]		= "imm",
+	[BPF_LOOP_INC]		= "increasing",
+	[BPF_LOOP_DEC]		= "decreasing",
+};
+
+struct bb_state_reg {
+	int reg;	/* register number */
+	int off;	/* offset in stack or unused */
+	int size;	/* size in stack or unused */
+	s64 smin_value; /* minimum possible (s64)value */
+	s64 smax_value; /* maximum possible (s64)value */
+	u64 umin_value; /* minimum possible (u64)value */
+	u64 umax_value; /* maximum possible (u64)value */
+	enum bpf_indvar_state state;
+};
+
+struct bb_state {
+	struct bb_node *bb;
+	struct list_head list;
+	int insn;
+	int insn_cnt;
+	struct bb_state_reg src;
+	struct bb_state_reg dst;
+};
+
+struct bpf_loop_info {
+	struct list_head bb;
+	int bb_num;
+	int insn_cnt;
+	int insn_entry;
+	int insn_exit;
+	struct bb_state_reg src;
+	struct bb_state_reg dst;
+	u16 idx;
+	struct bpf_loop_info *next;
+};
+
+static u16 loop_idx;
+
+static void bpf_clear_state(struct bb_state *s)
+{
+	s->insn = s->insn_cnt = 0;
+
+	s->src.state = BPF_LOOP_UNKNOWN;
+	s->src.reg = s->src.off = s->src.size = 0;
+
+	s->dst.state = BPF_LOOP_UNKNOWN;
+	s->dst.reg = s->src.off = s->src.size = 0;
+}
 
 #define entry_bb(bb_list)		(struct bb_node *)(*bb_list)
 #define exit_bb(bb_list)		(struct bb_node *)(*(bb_list + 1))
@@ -790,13 +849,912 @@ free_dominfo:
 	return ret;
 }
 
-bool subprog_has_loop(struct cfg_node_allocator *allocator,
-		      struct bpf_subprog_info *subprog)
+static bool bb_search(struct bb_node *bb, struct bpf_loop_info *loop)
+{
+	struct bb_node_stack *i;
+
+	list_for_each_entry(i, &loop->bb, list) {
+		if (i->bb->idx == bb->idx)
+			return true;
+	}
+	return false;
+}
+
+void bpf_state_set_invalid(struct bb_state *state)
+{
+	state->src.state = BPF_LOOP_INVALID;
+	state->dst.state = BPF_LOOP_INVALID;
+}
+
+void bpf_state_set_stx(struct bb_state *state, const struct bpf_insn *insn)
+{
+	int size = bpf_size_to_bytes(BPF_SIZE(insn->code));
+
+	/* BPF_MEM | <size> | BPF_STX: *(size *) (dst_reg + off) = src_reg */
+	if (state->dst.reg == insn->dst_reg) {
+		state->dst.reg = insn->src_reg;
+		state->dst.off = insn->off;
+		state->dst.size = size;
+	} else if (state->src.reg == insn->dst_reg) {
+		state->src.reg = insn->src_reg;
+		state->src.off = insn->off;
+		state->src.size = size;
+	}
+}
+
+static void bpf_state_set_ldx(struct bpf_verifier_env *env,
+			      struct bb_state *state, const struct bpf_insn *insn)
+{
+	int off = insn->off;
+	int size = bpf_size_to_bytes(BPF_SIZE(insn->code));
+
+	/* BPF_MEM | <size> | BPF_LDX:  dst_reg = *(size *) (src_reg + off) */
+	if (state->dst.reg == insn->src_reg && state->dst.off == off) {
+		if (state->dst.size != size) {
+			bpf_verifier_log_write(env,
+					       "Loop tracing (dst) through BPF_LDX with mismatch sizes unsupported (%i != %i)\n",
+					       state->dst.size, size);
+			bpf_state_set_invalid(state);
+			return;
+		}
+		state->dst.reg = insn->dst_reg;
+	} else if (state->src.reg == insn->dst_reg && state->dst.off == off) {
+		if (state->src.size != size) {
+			bpf_verifier_log_write(env,
+					       "Loop tracing (src) through BPF_LDX with mismatch sizes unsupported (%i != %i)\n",
+					       state->src.size, size);
+			bpf_state_set_invalid(state);
+			return;
+		}
+		state->src.reg = insn->dst_reg;
+	}
+}
+
+void bpf_state_set_xadd(struct bb_state *state, const struct bpf_insn *insn)
+{
+	/* Bail out on XADD programs for the moment */
+	bpf_state_set_invalid(state);
+}
+
+static void _bpf_state_set_add(struct bpf_verifier_env *env,
+			       struct bb_state_reg *reg,
+			       const struct bpf_insn *insn, bool add)
+{
+	int sign;
+
+	/* Currently, only basic induction variables are supported. So we
+	 * require "reg += const" this limitation is artificial and we can support
+	 * more complex linear statements 'x += y' and 'x = x + a y' with additional
+	 * verifier effort. However, lets see if this is actually needed before
+	 * we add recursive path search for n-order induction variables.
+	 */
+	if (BPF_SRC(insn->code) == BPF_K) {
+		/* BPF_ADD/BPF_NEG by zero is a NOP just return */
+		if (insn->imm == 0)
+			return;
+
+		if (add)
+			sign = insn->imm < 0 ? BPF_LOOP_DEC : BPF_LOOP_INC;
+		else
+			sign = insn->imm < 0 ? BPF_LOOP_INC : BPF_LOOP_DEC;
+	} else {
+		reg->state = BPF_LOOP_INVALID;
+		return;
+	}
+
+	if (reg->state == BPF_LOOP_UNKNOWN)
+		reg->state = sign;
+	else if (reg->state == BPF_LOOP_INC && sign == BPF_LOOP_INC)
+		reg->state = BPF_LOOP_INC;
+	else if (reg->state == BPF_LOOP_DEC && sign == BPF_LOOP_DEC)
+		reg->state = BPF_LOOP_DEC;
+	else
+		reg->state = BPF_LOOP_INVALID;
+}
+
+static void bpf_state_set_add(struct bpf_verifier_env *env,
+			      struct bb_state *state,
+			      const struct bpf_insn *insn)
+{
+	if (state->dst.reg == insn->dst_reg) {
+		_bpf_state_set_add(env, &state->dst, insn, true);
+	} else if (state->src.reg == insn->dst_reg) {
+		_bpf_state_set_add(env, &state->src, insn, true);
+	} else {
+		bpf_state_set_invalid(state);
+		WARN_ON_ONCE(1);
+	}
+}
+
+static void bpf_state_set_sub(struct bpf_verifier_env *env,
+			      struct bb_state *state,
+			      const struct bpf_insn *insn)
+{
+	if (state->dst.reg == insn->dst_reg) {
+		_bpf_state_set_add(env, &state->dst, insn, false);
+	} else if (state->src.reg == insn->dst_reg) {
+		_bpf_state_set_add(env, &state->src, insn, false);
+	} else {
+		bpf_state_set_invalid(state);
+		WARN_ON_ONCE(1);
+	}
+}
+
+static void _bpf_state_set_move(struct bb_state_reg *reg, const struct bpf_insn *insn)
+{
+	if (BPF_SRC(insn->code) == BPF_K) {
+		u64 uimm = insn->imm;
+		s64 simm = (s64)insn->imm;
+
+		reg->state = BPF_LOOP_IMM;
+		reg->reg = -1;
+
+		reg->smin_value = simm;
+		reg->smax_value = simm;
+		reg->umin_value = uimm;
+		reg->umax_value = uimm;
+	} else {
+		reg->reg  = insn->src_reg;
+	}
+}
+void bpf_state_set_mov(struct bb_state *state, const struct bpf_insn *insn)
+{
+
+	if (state->dst.reg == insn->dst_reg) {
+		_bpf_state_set_move(&state->dst, insn);
+	} else if (state->src.reg == insn->dst_reg) {
+		_bpf_state_set_move(&state->src, insn);
+	} else {
+		bpf_state_set_invalid(state);
+		WARN_ON_ONCE(1);
+	}
+}
+
+void bpf_loop_state(struct bpf_verifier_env *env,
+		    int i, const struct bpf_insn *insn, struct bb_state *state)
+{
+	u8 class = BPF_CLASS(insn->code);
+
+	if (class == BPF_ALU || class == BPF_ALU64) {
+		u8 opcode;
+
+		if (state->src.reg != insn->dst_reg &&
+		    state->dst.reg != insn->dst_reg)
+			return;
+
+		opcode = BPF_OP(insn->code);
+		switch (opcode) {
+		case BPF_ADD:
+			bpf_state_set_add(env, state, insn);
+			break;
+		case BPF_SUB:
+			bpf_state_set_sub(env, state, insn);
+			break;
+		case BPF_MOV:
+			bpf_state_set_mov(state, insn);
+			break;
+		case BPF_DIV:
+		case BPF_OR:
+		case BPF_AND:
+		case BPF_LSH:
+		case BPF_RSH:
+		case BPF_MOD:
+		case BPF_XOR:
+		case BPF_ARSH:
+		case BPF_END:
+		default:
+			bpf_verifier_log_write(env,
+					      "%i: BPF_ALU%s: unsupported opcode (%u) invalidate state\n",
+					       i, class == BPF_ALU ? "" : "64",
+					       opcode);
+			bpf_state_set_invalid(state);
+			break;
+		}
+	} else if (class == BPF_STX) {
+		u8 mode = BPF_MODE(insn->code);
+
+		switch (mode) {
+		case BPF_MEM:
+			/* BPF_MEM | <size> | BPF_STX */
+			bpf_state_set_stx(state, insn);
+			break;
+		case BPF_XADD:
+			/* BPF_XADD | BPF_W | BPF_STX */
+			/* BPF_XADD | BPF_DW | BPF_STX */
+			bpf_state_set_xadd(state, insn);
+			break;
+		default:
+			bpf_verifier_log_write(env,
+					       "%i: BPF_STX: unsupported mode (%u) invalidate state\n",
+					       i, mode);
+			bpf_state_set_invalid(state);
+		}
+	} else if (class == BPF_ST) {
+		/* Unsupported at the moment */
+		bpf_verifier_log_write(env, "%i: BPF_ST: unsupported class invalidate state\n", i);
+		bpf_state_set_invalid(state);
+	} else if (class == BPF_LDX) {
+		u8 mode = BPF_MODE(insn->code);
+
+		if (mode != BPF_MEM) {
+			bpf_verifier_log_write(env,
+					      "%i: BPF_LDX: unsupported mode (%u) invalidate state\n",
+					      i, mode);
+			bpf_state_set_invalid(state);
+		} else {
+			/* BPF_MEM | <size> | BPF_LDX */
+			bpf_state_set_ldx(env, state, insn);
+		}
+	} else if (class == BPF_LD) {
+		/* Unsupported at the moment */
+		bpf_verifier_log_write(env, "%i: BPF_LD: unsupported class invalidate state\n", i);
+		bpf_state_set_invalid(state);
+	} else if (class == BPF_JMP) {
+		; // Jumps are verified by CFG
+	} else {
+		/* If we do not understand instruction invalidate state */
+		bpf_verifier_log_write(env, "%i: %u: unknown class invalidate state\n", i, class);
+		bpf_state_set_invalid(state);
+	}
+}
+
+/* bit noisy at the moment duplicates with print_regs */
+static void bpf_print_loop_info(struct bpf_verifier_env *env,
+				struct bpf_loop_info *loop)
+{
+	struct bpf_reg_state *regs, *src_reg = NULL, *dst_reg = NULL;
+
+	regs = cur_regs(env);
+	if (loop->src.reg >= 0)
+		src_reg = &regs[loop->src.reg];
+	if (loop->dst.reg >= 0)
+		dst_reg = &regs[loop->dst.reg];
+
+	bpf_verifier_log_write(env,
+			       "Loop %i: (%i:ty(%i))src.state(%s) (%i:ty(%i))dst.state(%s): R%d(%llu:%llu,%lld:%lld) R%d(%llu:%llu,%lld:%lld)\n",
+			       loop->idx,
+			       loop->src.reg, src_reg ? src_reg->type : -1,
+			       bpf_loop_state_str[loop->src.state],
+			       loop->dst.reg, dst_reg ? dst_reg->type : -1,
+			       bpf_loop_state_str[loop->dst.state],
+			       loop->src.reg,
+			       src_reg ? src_reg->umin_value : loop->src.umin_value,
+			       src_reg ? src_reg->umax_value : loop->src.umax_value,
+			       src_reg ? src_reg->smin_value : loop->src.smin_value,
+			       src_reg ? src_reg->smax_value : loop->src.smax_value,
+			       loop->dst.reg,
+			       dst_reg ? dst_reg->umin_value : loop->dst.umin_value,
+			       dst_reg ? dst_reg->umax_value : loop->dst.umax_value,
+			       dst_reg ? dst_reg->smin_value : loop->dst.smin_value,
+			       dst_reg ? dst_reg->smax_value : loop->dst.smax_value);
+}
+
+static bool bpf_op_sign(u8 op)
+{
+	switch (op) {
+	case BPF_JNE:
+	case BPF_JGT:
+	case BPF_JGE:
+		return false;
+	case BPF_JSGT:
+	case BPF_JSGE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Verify conditions necessary to ensure increasing/decreasing loop induction
+ * variables will in fact terminate.
+ *
+ * 1. Increasing/decreasing variables _must_ be paired with a bounded variable
+ *    in this case BPF_LOOP_IMM type.
+ * 2. Increasing/decreasing variables _must_ have a "known" worst case starting
+ *    bound. For example if an increasing variable has no min value we can not
+ *    say it will actually terminate. So test increasing variables have mins
+ *    and decreasing variables have maxs.
+ * 3. The known min/max bound must match the comparison sign
+ *
+ * After this we know that a loop will increase or decrease and eventually
+ * terminate.
+ */
+static int bpf_cfg_valid_bounds(struct bpf_verifier_env *env, u8 op,
+				struct bpf_reg_state *src_reg,
+				struct bpf_reg_state *dst_reg,
+				struct bpf_loop_info *loop)
+{
+	bool sign = bpf_op_sign(op);
+
+	switch (loop->src.state) {
+	/*
+	 * dev note: improve verbose messaging, and maybe refactor the
+	 * switch stmt
+	 */
+	case BPF_LOOP_IMM:
+		if (!dst_reg) {
+			bpf_verifier_log_write(env, "internal cfg error: missing dst_reg LOOP_IMM!\n");
+			return -1;
+		}
+
+		if (loop->dst.state == BPF_LOOP_INC) {
+			if (sign && dst_reg->smin_value == S64_MIN) {
+				bpf_verifier_log_write(env,
+						       "increasing loop induction variable (towarads imm) unbounded min value\n");
+				return -1;
+			}
+		} else if (loop->dst.state == BPF_LOOP_DEC) {
+			if ((sign && dst_reg->smax_value == S64_MAX) ||
+			    (!sign && dst_reg->umax_value == U64_MAX)) {
+				bpf_verifier_log_write(env,
+						       "decreasing loop induction variable (towards imm) unbounded max value\n");
+				return -1;
+			}
+		} else {
+			return -1;
+		}
+		break;
+	case BPF_LOOP_INC:
+		if (loop->dst.state != BPF_LOOP_IMM) {
+			bpf_verifier_log_write(env,
+					       "increasing loop induction variable not towards imm\n");
+			return -1;
+		}
+
+		if (!src_reg) {
+			bpf_verifier_log_write(env, "internal cfg error: missing src_reg LOOP_INC!\n");
+			return -1;
+		}
+
+		if (sign && src_reg->smin_value == S64_MIN) {
+			bpf_verifier_log_write(env,
+					       "increasing loop induction variable unbounded min value\n");
+			return -1;
+		}
+		break;
+	case BPF_LOOP_DEC:
+		if (loop->dst.state != BPF_LOOP_IMM) {
+			bpf_verifier_log_write(env,
+					       "decreasing loop induction variable not towards imm\n");
+			return -1;
+		}
+
+		if (!src_reg) {
+			bpf_verifier_log_write(env, "internal cfg error: missing src_reg LOOP_DEC!\n");
+			return -1;
+		}
+
+		if ((sign && src_reg->smax_value == S64_MAX) ||
+		    (!sign && src_reg->umax_value == U64_MAX)) {
+			bpf_verifier_log_write(env,
+					       "decreasing loop induction variable unbounded max value\n");
+			return -1;
+		}
+		break;
+	default:
+		bpf_verifier_log_write(env, "loop state unknown/invalid\n");
+		return -1;
+	}
+	return 0;
+}
+
+/* Before calling bpf_cfg_deduce_bounds we ensured the loop does in fact
+ * terminate. (Because increasing/decreasing towards a constant) But, if
+ * left as is each iteration of the loop will be a new state. This is a
+ * result of the loop induction variable, by definition, being incremented
+ * or decremented by a constant each iteration of the loop.
+ *
+ * To resolve this we know the worst case iteration count and the step
+ * of each iteration so we know the expected range of the indvar. Here
+ * we calculate and set the min/max to the worst case range.
+ */
+static int bpf_cfg_deduce_bounds(struct bpf_verifier_env *env, u8 op,
+				 struct bpf_reg_state *src_reg,
+				 struct bpf_reg_state *dst_reg,
+				 struct bpf_loop_info *loop)
+{
+	int err = 0;
+
+	/* Need to consider overflow cases? */
+	/* Need to consider step > 1 */
+	if (loop->src.state == BPF_LOOP_INC) {
+		switch (op) {
+		case BPF_JNE:
+		case BPF_JGT:
+		case BPF_JGE:
+		case BPF_JSGT:
+		case BPF_JSGE:
+			src_reg->umax_value = loop->dst.umax_value;
+			src_reg->smax_value = loop->dst.smax_value;
+			src_reg->smax_value = loop->dst.smax_value;
+			src_reg->umax_value = loop->dst.umax_value;
+			break;
+		default:
+			bpf_verifier_log_write(env, "src.state INC, invalid opcode %u", op);
+			err = -1;
+			break;
+		}
+		src_reg->var_off = tnum_range(src_reg->umin_value,
+					      src_reg->umax_value);
+	} else if (loop->src.state == BPF_LOOP_DEC) {
+		switch (op) {
+		case BPF_JNE:
+		case BPF_JGT:
+		case BPF_JGE:
+		case BPF_JSGT:
+		case BPF_JSGE:
+			src_reg->umin_value = loop->dst.umin_value;
+			src_reg->smin_value = loop->dst.smin_value;
+			break;
+		default:
+			bpf_verifier_log_write(env, "src.state INC, invalid opcode %u", op);
+			err = -1;
+			break;
+		}
+		src_reg->var_off = tnum_range(src_reg->umin_value,
+					      src_reg->umax_value);
+	} else if (loop->dst.state == BPF_LOOP_INC) {
+		switch (op) {
+		case BPF_JNE:
+		case BPF_JGT:
+		case BPF_JGE:
+		case BPF_JSGT:
+		case BPF_JSGE:
+			dst_reg->umax_value = loop->src.umax_value;
+			dst_reg->smax_value = loop->src.smax_value;
+			break;
+		default:
+			bpf_verifier_log_write(env, "dst.state INC, invalid opcode %u", op);
+			err = -1;
+			break;
+		}
+		dst_reg->var_off = tnum_range(dst_reg->umin_value,
+					      dst_reg->umax_value);
+	} else if (loop->dst.state == BPF_LOOP_DEC) {
+		switch (op) {
+		case BPF_JNE:
+		case BPF_JLT:
+		case BPF_JLE:
+		case BPF_JSLT:
+		case BPF_JSLE:
+			dst_reg->umin_value = loop->src.umin_value;
+			dst_reg->smin_value = loop->src.smin_value;
+			break;
+		default:
+			bpf_verifier_log_write(env, "dst.state DEC, invalid opcode %u", op);
+			err = -1;
+			break;
+		}
+		dst_reg->var_off = tnum_range(dst_reg->umin_value,
+					      dst_reg->umax_value);
+	} else {
+		bpf_verifier_log_write(env, "internal cfg error: unknown src|dst state\n");
+		err = -1;
+	}
+
+	return err;
+}
+
+static int bb_stack_push(struct bb_node *node, struct bpf_loop_info *loop)
+{
+	struct bb_node_stack *n;
+
+	n = kzalloc(sizeof(struct bb_node_stack), GFP_KERNEL);
+	if (!n)
+		return -ENOMEM;
+
+	n->bb = node;
+	list_add(&n->list, &loop->bb);
+	return 0;
+}
+
+static struct bb_node *bb_stack_pop(struct bpf_loop_info *loop)
+{
+	struct bb_node *bb = NULL;
+	struct bb_node_stack *n;
+
+	n = list_first_entry_or_null(&loop->bb, struct bb_node_stack, list);
+	if (n) {
+		list_del(&n->list);
+		bb = n->bb;
+	}
+	kfree(n);
+	return bb;
+}
+
+static void bpf_free_loop(struct bpf_loop_info *loop)
+{
+	struct bb_node *bb = bb_stack_pop(loop);
+
+	while (bb)
+		bb = bb_stack_pop(loop);
+	kfree(loop);
+}
+
+/* CFG verified the loop is normal and that either src or dst is a
+ * basic loop induction variable but we still need to ensure min/max
+ * values will guarentee termination and that trip count is reasonable.
+ *
+ * There are a few cases that need to be handled. First the easy case, if the
+ * CFG loop scan found that one of the registers is an IMM value then we need
+ * only verify that the other register has a min or max value depending on
+ * increasing/decreasing induction variable. The more complicated case is when
+ * the loop scan has yet to resolve one of the registers bounds. (Note having
+ * two unknowns is not valid because we would have no guarantees the loop
+ * induction variable is increasing or decreasing) At this point we need to
+ * lookup the register and verify it does have a known min/max value without
+ * these bounds we can not make any statement about termination.
+ *
+ * Then we make a worse case instruction count analysis and when the loop
+ * latch is completed this will be added to the total instruction count.
+ *
+ * Finally, with worst case insn count completed and valid bounds go ahead
+ * and mark the register with the induction type indicator.
+*/
+int bpf_check_loop_header(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_reg_state *regs, *src_reg = NULL, *dst_reg = NULL;
+	struct bpf_insn *insn = env->prog->insnsi;
+	struct bpf_loop_info *loop;
+	int err = 0;
+	u8 op;
+
+	loop = env->insn_aux_data[insn_idx].loop;
+	if (!loop)
+		return 0;
+
+	regs = cur_regs(env);
+	if (loop->src.reg >= 0)
+		src_reg = &regs[loop->src.reg];
+	if (loop->dst.reg >= 0)
+		dst_reg = &regs[loop->dst.reg];
+
+	op = BPF_OP(insn[loop->insn_exit].code);
+
+	/* If one of the states is unknown we have some options. We could
+	 * try to do a path walk backwards and see if the value is valid.
+	 * Or we could look at the bounds here and see if we can infer
+	 * anything from that.
+	 *
+	 * What I've found from experimentation is usually due to stack
+	 * spilling and operations that leave the variable in unknown
+	 * state we don't learn much here.
+	 *
+	 * At one point I tried some code to walk back in the tree but
+	 * I didn't like that very much either. Right now my working
+	 * assumption is we can make the bounds tracking good enough
+	 * to avoid walking back through the tree.
+	 */
+	if (loop->dst.state == BPF_LOOP_UNKNOWN ||
+	    loop->src.state == BPF_LOOP_UNKNOWN) {
+		bpf_verifier_log_write(env, "bpf loop unknown state!\n");
+		return -1;
+	}
+
+	err = bpf_cfg_valid_bounds(env, op, src_reg, dst_reg, loop);
+	if (err) {
+		bpf_verifier_log_write(env, "bpf cfg loop has invalid bounds!\n");
+		return -1;
+	}
+
+	/* At this point the bounds are valid */
+
+	/* We are going to push worse case bounds on to the loop induction
+	 * variable this way when we run symbolic execution we check validity
+	 * of min and max values. This allows the state pruning logic to have
+	 * a chance at pruning the state.
+	 *
+	 * At the moment we only track the loop induction variables any other
+	 * induction variables in the loop (linear or otherwise) will force
+	 * the loop to iterate through every case presumably exploding the
+	 * state complexity. E.g. simple example is the following,
+	 *
+	 *   for (i = 0, j = 0; i < const; i++, j++) { ... }
+	 *
+	 * Improving the induction variable logic can catch the above case
+	 * and many more.
+	 */
+	err = bpf_cfg_deduce_bounds(env, op, src_reg, dst_reg, loop);
+	if (err) {
+		bpf_verifier_log_write(env, "bpf cfg loop could not deduce bounds!\n");
+		return -1;
+	}
+
+	bpf_print_loop_info(env, loop);
+
+	/* Instruction count is being used as an approximation for runtime.
+	 * Loops have the potential to iterative many times over a single
+	 * set of instructions. To account for this charge instruction count
+	 * limits the worst case path times the worst case number of iterations.
+	 */
+	// tbd
+
+	/* Mark insn for indvar tracking informs the execution engine when
+	 * it can avoid updating bounds on an insn. This is required to
+	 * allow the pruning logic to eventually prune the loop state.
+	 */
+	if (loop->dst.state == BPF_LOOP_DEC ||
+	    loop->dst.state == BPF_LOOP_INC)
+		dst_reg->indvar = loop->dst.state;
+	else if (loop->src.state == BPF_LOOP_DEC ||
+		 loop->src.state == BPF_LOOP_INC)
+		src_reg->indvar = loop->src.state;
+
+	/* Loop _will_ terminate remove reference and let the state pruning
+	 * do its job.
+	 */
+	env->insn_aux_data[insn_idx].loop = NULL;
+	bpf_free_loop(loop);
+	return 1;
+}
+
+static int bpf_is_valid_loop_state(struct bpf_loop_info *loop)
+{
+	if (loop->src.state == BPF_LOOP_INVALID ||
+	    loop->dst.state == BPF_LOOP_INVALID)
+		return -1;
+
+	switch (loop->src.state) {
+	case BPF_LOOP_UNKNOWN:
+	case BPF_LOOP_IMM:
+		if (loop->dst.state == BPF_LOOP_INC ||
+		    loop->dst.state == BPF_LOOP_DEC)
+			return 0;
+		break;
+	case BPF_LOOP_DEC:
+	case BPF_LOOP_INC:
+		if (loop->dst.state == BPF_LOOP_UNKNOWN ||
+		    loop->dst.state == BPF_LOOP_IMM)
+			return 0;
+		break;
+	}
+
+	return -1;
+}
+
+static void bb_state_stack_push(struct bb_state *state, struct list_head *stack)
+{
+	list_add(&state->list, stack);
+}
+
+static struct bb_state *bb_state_stack_pop(struct list_head *stack)
+{
+	struct bb_state *s;
+
+	s = list_first_entry_or_null(stack, struct bb_state, list);
+	if (s)
+		list_del(&s->list);
+	return s;
+}
+
+static int build_loop_info(struct bpf_verifier_env *env,
+			   struct cfg_node_allocator *allocator,
+			   struct bpf_subprog_info *subprog,
+			   struct bb_node *head,
+			   struct bb_node *tail)
+{
+	struct bpf_insn *insns = env->prog->insnsi;
+	bool has_branch, only_has_branch;
+	struct list_head bb_state_stack;
+	struct bb_state *state = NULL;
+	struct bpf_loop_info *loop;
+	struct bb_node *next_bb;
+	struct bpf_insn *insn;
+	int err = 0;
+	u8 code;
+
+	loop = kzalloc(sizeof(struct bpf_loop_info), GFP_KERNEL);
+	if (!loop)
+		return -ENOMEM;
+
+	loop->src.state = BPF_LOOP_UNKNOWN;
+	loop->dst.state = BPF_LOOP_UNKNOWN;
+	loop->idx = loop_idx++;
+	INIT_LIST_HEAD(&loop->bb);
+	INIT_LIST_HEAD(&bb_state_stack);
+
+	state = kzalloc(sizeof(struct bb_state), GFP_KERNEL);
+	if (!state) {
+		kfree(loop);
+		return -ENOMEM;
+	}
+
+	/* Initialize stack for path walk. To track the loop induction
+	 * variable we will walk all paths back from the last instruction
+	 * to the first instruction in the loop.
+	 */
+	next_bb = bb_next(allocator, head);
+	state->bb = head;
+	state->insn = next_bb->head - 1;
+	insn = &insns[state->insn];
+	code = insn->code;
+	if (BPF_SRC(insn->code) == BPF_K) {
+		_bpf_state_set_move(&state->src, insn);
+	} else {
+		state->src.state = BPF_LOOP_UNKNOWN;
+		state->src.reg = insn->src_reg;
+	}
+	state->dst.state = BPF_LOOP_UNKNOWN;
+	state->dst.reg = insn->dst_reg;
+	state->insn_cnt = 0;
+
+	bb_state_stack_push(state, &bb_state_stack);
+	err = bb_stack_push(tail, loop);
+	if (err)
+		goto out;
+
+	loop->insn_entry = tail->head;
+	loop->insn_exit = next_bb->head - 1;
+
+	/* This is a pattern match on the loop type we expect loops
+	 * of the form,
+	 *
+	 *   header
+	 *   ...
+	 *   if (r1 > r2) goto header
+	 *   ...
+	 *
+	 * Where the jump is not a BPF_JA instruction. However sometimes
+	 * we get loops like the following,
+	 *
+	 *  header
+	 *  ...
+	 *  if (r1 > r2) goto out_of_loop
+	 *  ...
+	 *  goto header
+	 *
+	 *  Here the bounding condition is inside the loop and not in the
+	 *  last BB. Presumably we can handle these as well with additional
+	 *  searching to find the latch element. However it makes the scanning
+	 *  a bit more painful. For simplicity test if tail is valid latch and
+	 *  throw out other constructs.
+	 *
+	 *  TBD handle nested loops.
+	 */
+	only_has_branch = BPF_CLASS(code) == BPF_JMP &&
+			  BPF_OP(code) == BPF_JA;
+	if (only_has_branch) {
+		bpf_verifier_log_write(env,
+				       "non-terminating loop detected e(%i->%i)\n",
+				       head->idx, tail->idx);
+		return -EINVAL;
+	}
+
+	has_branch = only_has_branch ||
+		     (BPF_CLASS(code) == BPF_JMP &&
+		      BPF_OP(code) != BPF_EXIT &&
+		      BPF_OP(code) != BPF_CALL);
+	if (!has_branch) {
+		bpf_verifier_log_write(env,
+				       "loop without branches (class %i op %i), must be a verifier bug? e(%i->%i)\n",
+				       BPF_CLASS(code), BPF_OP(code), head->idx, tail->idx);
+		return -EINVAL;
+	}
+
+
+	/* With a valid branch then either src or dst register must be monotonic for
+	 * the loop to terminate. To detect this do a path walk through the loop and
+	 * ensure that monotonic property holds in each path.
+	 */
+	state = bb_state_stack_pop(&bb_state_stack);
+	while (state) {
+		int bb_tail, bb_head;
+		struct edge_node *e;
+		struct bb_node *bb;
+		bool found;
+
+		bb = state->bb;
+		found = bb_search(bb, loop);
+		if (!found)
+			bb_stack_push(bb, loop);
+		next_bb = bb_next(allocator, bb);
+		bb_tail = next_bb->head - 1;
+		bb_head = bb->head;
+
+		while (bb_tail >= bb_head) {
+			bpf_loop_state(env, bb_tail, &insns[bb_tail], state);
+			bb_tail--;
+			state->insn_cnt++;
+		}
+
+		if (state->src.state == BPF_LOOP_INVALID ||
+		    state->dst.state == BPF_LOOP_INVALID) {
+			bpf_verifier_log_write(env,
+					       "Detected BPF_LOOP_INVALID state\n");
+			goto out;
+		}
+
+		/* If this is the last node in the loop ensure the loop states
+		 * have not changed with paths. For example, it would be invalid
+		 * to have two paths one where the induction variable increases
+		 * and another where it decreases. If the state is invalid abort
+		 * now because if any single path fails the loop is invalid.
+		 *
+		 * Finally, assuming state is valid continue processing stack
+		 * giving the next path trace.
+		 */
+		if (bb == tail) {
+			if (state->src.state != loop->src.state &&
+			    loop->src.state != BPF_LOOP_UNKNOWN) {
+				bpf_verifier_log_write(env,
+						       "Paths (src) do not align %i != %i\n",
+						       state->src.state,
+						       loop->src.state);
+
+				goto out;
+			}
+			if (state->dst.state != loop->dst.state &&
+			    loop->dst.state != BPF_LOOP_UNKNOWN) {
+				bpf_verifier_log_write(env,
+						       "Paths (dst) do not align %i != %i\n",
+						       state->src.state,
+						       loop->src.state);
+				goto out;
+			}
+
+			if (loop->insn_cnt < state->insn_cnt)
+				loop->insn_cnt = state->insn_cnt;
+
+			loop->dst = state->dst;
+			loop->src = state->src;
+
+			bpf_clear_state(state);
+			kfree(state);
+			state = bb_state_stack_pop(&bb_state_stack);
+			continue;
+		}
+
+		e = cfg_node_delink(allocator, &bb->e_prevs);
+		while (e) {
+			struct bb_node *src = e->src;
+			struct bb_state *old = state;
+			struct bb_state *new;
+
+			new = kzalloc(sizeof(struct bb_state), GFP_KERNEL);
+			if (!state)
+				goto out;
+
+			next_bb = bb_next(allocator, src);
+
+			*new = *old;
+			new->bb = src;
+			new->insn = next_bb->head - 1;
+			bb_state_stack_push(new, &bb_state_stack);
+
+			e = cfg_node_delink(allocator, &e->link);
+		}
+		kfree(state);
+		state = bb_state_stack_pop(&bb_state_stack);
+	}
+	if (bpf_is_valid_loop_state(loop))
+		goto out;
+
+	bpf_verifier_log_write(env,
+			      "Loop detected e(%i->%i) insn(%i) src_state(R%i:%s) dst_state(R%i:%s)\n",
+			       head->idx, tail->idx, loop->insn_cnt,
+			       loop->src.reg,
+			       bpf_loop_state_str[loop->src.state],
+			       loop->dst.reg,
+			       bpf_loop_state_str[loop->dst.state]);
+	env->insn_aux_data[loop->insn_entry].loop = loop;
+	return 0;
+out:
+	while (state) {
+		kfree(state);
+		state = bb_state_stack_pop(&bb_state_stack);
+	}
+	bpf_free_loop(loop);
+	return -1;
+}
+
+int subprog_has_loop(struct bpf_verifier_env *env,
+		     struct cfg_node_allocator *allocator,
+		     struct bpf_subprog_info *subprog)
 {
 	int lane_len = BITS_TO_LONGS(subprog->bb_num - 2);
 	struct bb_node *bb, *entry_bb, *exit_bb;
 	void **bb_list = (void **)&subprog->bbs;
 	struct edge_node *e;
+	int err = 0;
 
 	entry_bb = entry_bb(bb_list);
 	exit_bb = exit_bb(bb_list);
@@ -808,8 +1766,11 @@ bool subprog_has_loop(struct cfg_node_allocator *allocator,
 
 			if (latch != entry_bb &&
 			    test_bit(bb->idx,
-				     subprog->dtree + latch->idx * lane_len))
-				return true;
+				     subprog->dtree + latch->idx * lane_len)) {
+				err = build_loop_info(env, allocator, subprog, latch, bb);
+				if (err)
+					return err;
+			}
 
 			e = cfg_node_delink(allocator, &e->link);
 		}
@@ -817,7 +1778,7 @@ bool subprog_has_loop(struct cfg_node_allocator *allocator,
 		bb = bb_next(allocator, bb);
 	}
 
-	return false;
+	return 0;
 }
 
 /* We don't want to do any further loop bounds analysis for irreducible loop,
