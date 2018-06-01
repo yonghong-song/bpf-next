@@ -1304,6 +1304,13 @@ load_program(enum bpf_prog_type type, enum bpf_attach_type expected_attach_type,
 	if (ret >= 0) {
 		*pfd = ret;
 		ret = 0;
+
+		pr_warning("load bpf program succesful\n");
+		if (log_buf && log_buf[0] != '\0') {
+			pr_warning("-- BEGIN DUMP LOG ---\n");
+			pr_warning("\n%s\n", log_buf);
+			pr_warning("-- END LOG --\n");
+		}
 		goto out;
 	}
 

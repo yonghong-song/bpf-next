@@ -200,7 +200,7 @@ int bpf_load_program_xattr(const struct bpf_load_program_attr *load_attr,
 	attr.license = ptr_to_u64(load_attr->license);
 	attr.log_buf = ptr_to_u64(NULL);
 	attr.log_size = 0;
-	attr.log_level = 0;
+	attr.log_level = 1;
 	attr.kern_version = load_attr->kern_version;
 	attr.prog_ifindex = load_attr->prog_ifindex;
 	memcpy(attr.prog_name, load_attr->name,
