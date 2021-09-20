@@ -3380,7 +3380,7 @@ static int check_packet_access(struct bpf_verifier_env *env, u32 regno, int off,
 /* check access to 'struct bpf_context' fields.  Supports fixed offsets only */
 static int check_ctx_access(struct bpf_verifier_env *env, int insn_idx, int off, int size,
 			    enum bpf_access_type t, enum bpf_reg_type *reg_type,
-			    struct btf **btf, u32 *btf_id)
+			    struct btf **btf, u32 *btf_id, bool *userptr)
 {
 	struct bpf_insn_access_aux info = {
 		.reg_type = *reg_type,
@@ -3401,6 +3401,7 @@ static int check_ctx_access(struct bpf_verifier_env *env, int insn_idx, int off,
 		if (*reg_type == PTR_TO_BTF_ID || *reg_type == PTR_TO_BTF_ID_OR_NULL) {
 			*btf = info.btf;
 			*btf_id = info.btf_id;
+			*userptr = info.userptr;
 		} else {
 			env->insn_aux_data[insn_idx].ctx_field_size = info.ctx_field_size;
 		}
@@ -4191,6 +4192,7 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 	} else if (reg->type == PTR_TO_CTX) {
 		enum bpf_reg_type reg_type = SCALAR_VALUE;
 		struct btf *btf = NULL;
+		bool userptr = false;
 		u32 btf_id = 0;
 
 		if (t == BPF_WRITE && value_regno >= 0 &&
@@ -4203,7 +4205,7 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		if (err < 0)
 			return err;
 
-		err = check_ctx_access(env, insn_idx, off, size, t, &reg_type, &btf, &btf_id);
+		err = check_ctx_access(env, insn_idx, off, size, t, &reg_type, &btf, &btf_id, &userptr);
 		if (err)
 			verbose_linfo(env, insn_idx, "; ");
 		if (!err && t == BPF_READ && value_regno >= 0) {
@@ -4228,6 +4230,7 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 				    reg_type == PTR_TO_BTF_ID_OR_NULL) {
 					regs[value_regno].btf = btf;
 					regs[value_regno].btf_id = btf_id;
+					regs[value_regno].userptr = userptr;
 				}
 			}
 			regs[value_regno].type = reg_type;
@@ -4289,6 +4292,10 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		if (!err && t == BPF_READ && value_regno >= 0)
 			mark_reg_unknown(env, regs, value_regno);
 	} else if (reg->type == PTR_TO_BTF_ID) {
+		if (reg->userptr) {
+			verbose(env, "R%d+%d userptr access\n", regno, off);
+			return -EACCES;
+		}
 		err = check_ptr_to_btf_access(env, regs, regno, off, size, t,
 					      value_regno);
 	} else if (reg->type == CONST_PTR_TO_MAP) {

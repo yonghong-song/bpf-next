@@ -4827,6 +4827,35 @@ static bool is_string_ptr(struct btf *btf, const struct btf_type *t)
 	return btf_type_is_int(t) && t->size == 1;
 }
 
+static bool is_btf_user_access(const struct btf *btf,
+			       const struct btf_type *func_proto, int arg)
+{
+	const struct btf_type *t;
+	u32 i, total;
+
+	total = btf_nr_types(btf);
+	for (i = 1; i < total; i++) {
+		t = btf_type_by_id(btf, i);
+		if (BTF_INFO_KIND(t->info) != BTF_KIND_TAG)
+			continue;
+
+		if (btf_type_tag(t)->component_idx != arg)
+			continue;
+
+		t = btf_type_by_id(btf, t->type);
+		if (BTF_INFO_KIND(t->info) != BTF_KIND_FUNC)
+			continue;
+
+		t = btf_type_by_id(btf, t->type);
+		if (t != func_proto)
+			continue;
+
+		return true;
+	}
+
+	return false;
+}
+
 bool btf_ctx_access(int off, int size, enum bpf_access_type type,
 		    const struct bpf_prog *prog,
 		    struct bpf_insn_access_aux *info)
@@ -4998,9 +5027,11 @@ bool btf_ctx_access(int off, int size, enum bpf_access_type type,
 			tname, arg, btf_kind_str[BTF_INFO_KIND(t->info)]);
 		return false;
 	}
-	bpf_log(log, "func '%s' arg%d has btf_id %d type %s '%s'\n",
+
+	info->userptr = is_btf_user_access(btf, prog->aux->attach_func_proto, arg);
+	bpf_log(log, "func '%s' arg%d has btf_id %d type %s '%s' userptr %d\n",
 		tname, arg, info->btf_id, btf_kind_str[BTF_INFO_KIND(t->info)],
-		__btf_name_by_offset(btf, t->name_off));
+		__btf_name_by_offset(btf, t->name_off), info->userptr);
 	return true;
 }
 
