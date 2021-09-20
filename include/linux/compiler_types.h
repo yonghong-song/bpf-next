@@ -75,6 +75,18 @@ static inline void __chk_io_ptr(const volatile void __iomem *ptr) { }
 #define __has_builtin(x) (0)
 #endif
 
+#if defined(__CHECKER__) || defined(STRUCTLEAK_PLUGIN)
+# define __userptr	__user
+/*
+ * If btf_tag attribute is supported, define __userptr for tagging var,
+ * struct/union member, or func parameter user pointers.
+ */
+#elif __has_attribute(btf_tag)
+# define __userptr	__attribute__((btf_tag("user")))
+#else
+# define __userptr
+#endif
+
 /* Compiler specific macros. */
 #ifdef __clang__
 #include <linux/compiler-clang.h>
